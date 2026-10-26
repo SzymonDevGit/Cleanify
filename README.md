@@ -24,6 +24,7 @@ Address: https://cleanify.szy.monster/
 
 ## Spotify app settings
 
+Make the app at https://developer.spotify.com/dashboard/create (the dashboard's Create app button doesn't always show).
 Add these Redirect URIs to your Spotify app and tick **Web API** and **Web Playback SDK**:
 
 - `https://cleanify.szy.monster/`
