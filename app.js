@@ -583,7 +583,11 @@ function render() {
     .filter((c, i) => i === 2 || left[2 - i]);
   deck.prepend(...cards);
   preloadCovers(left.slice(3, 6));
-  if (prev !== state.current && autoplay() && !state.busy) schedulePlay();
+  if (prev !== state.current && !state.busy) {
+    if (autoplay()) schedulePlay();
+    // Without Autoplay, don't leave the last card's song playing under a new card.
+    else if (nowPlaying && !sameSong({ uri: nowPlaying.uri, name: nowPlaying.title }, state.current)) { playSeq++; pausePlayback(); }
+  }
 }
 
 // Fetch the next few covers early so cards don't appear blank.
@@ -810,7 +814,32 @@ function schedulePlay() {
   playTimer = setTimeout(playCurrent, 350);
 }
 
+// What Cleanify last started: {uri, title, deviceId}. Used to keep Spotify on the card's
+// song: pause when the card moves on (without Autoplay), or when Spotify skips ahead.
+let nowPlaying = null;
 let playSeq = 0;
+
+function sameSong(item, t) {
+  if (!item || !t) return false;
+  return item.uri === t.uri || (item.linked_from && item.linked_from.uri === t.uri) || plain(item.name) === plain(t.title);
+}
+
+// After a play request, check Spotify really plays the card's song. Some phones ignore
+// the requested start song when shuffle is on, and some apps ignore single-song plays.
+async function confirmPlaying(t, seq) {
+  for (let i = 0; i < 8; i++) {
+    await sleep(500);
+    if (seq !== playSeq) return true;
+    let st;
+    try { st = await api("/me/player?additional_types=track"); } catch { return true; }  // can't tell: trust it
+    if (st && st.item && sameSong(st.item, t)) return true;
+    if (st && st.item && i >= 3) return false;
+  }
+  return false;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function playCurrent() {
   clearTimeout(playTimer);
   const t = state.current;
@@ -827,23 +856,93 @@ async function playCurrent() {
     }
   }
   const start = Math.min(30000, Math.floor((t.duration || 0) / 3));
-  const fromPlaylist = { context_uri: state.playlist.uri, offset: { uri: t.uri }, position_ms: start };
-  const single = { uris: [t.uri], position_ms: start };
+  // Two ways to start a song. "song" plays just that song (it stops at the end, and
+  // shuffle can't change it); "playlist" starts it inside the playlist, for Spotify apps
+  // that ignore single-song requests. The way that worked is remembered per device.
+  const ways = {
+    song: { uris: [t.uri], position_ms: start },
+    playlist: { context_uri: state.playlist.uri, offset: { uri: t.uri }, position_ms: start },
+  };
+  const methods = store.get("cl_play_methods", {});
+  const first = methods[device.name] || "song";
+  const order = [first, first === "song" ? "playlist" : "song"];
+  setStatus("play-status", "Starting…");
   try {
-    try {
-      await playOn(device, fromPlaylist);
-    } catch (err) {
-      if (err.status !== 400) throw err;
-      await playOn(device, single);
+    let lastErr = null;
+    for (const way of order) {
+      if (seq !== playSeq) return;
+      let deviceId;
+      try {
+        if (way === "playlist") await setShuffle(device, false);
+        deviceId = await playOn(device, ways[way]);
+      } catch (err) {
+        if (err.status !== 400) throw err;
+        lastErr = err;
+        continue;
+      }
+      if (seq !== playSeq) return;
+      if (await confirmPlaying(t, seq)) {
+        if (seq !== playSeq) return;
+        methods[device.name] = way;
+        store.set("cl_play_methods", methods);
+        nowPlaying = { uri: t.uri, title: t.title, deviceId };
+        watchPlayback();
+        $("play-btn").classList.add("on");
+        if (state.current === t) setStatus("play-status", "");
+        return;
+      }
+      lastErr = new ApiError(0, `Spotify played a different song instead of "${t.title}".`);
     }
-    if (seq !== playSeq) return;
-    $("play-btn").classList.add("on");
-    if (state.current === t) setStatus("play-status", "");
+    throw lastErr;
   } catch (err) {
     if (seq !== playSeq) return;
     stopAutoplay();
     setStatus("play-status", playError(err), "err");
   }
+}
+
+async function setShuffle(device, on) {
+  const id = device.id === BROWSER ? browser.id : device.id;
+  if (!id) return;
+  try { await api(`/me/player/shuffle?state=${on}&device_id=${encodeURIComponent(id)}`, { method: "PUT" }); } catch { /* not important */ }
+}
+
+async function pausePlayback() {
+  const p = nowPlaying;
+  nowPlaying = null;
+  stopAutoplay();
+  if (!p) return;
+  try { await api(`/me/player/pause?device_id=${encodeURIComponent(p.deviceId)}`, { method: "PUT" }); } catch { /* already stopped */ }
+}
+
+// While a song from Cleanify plays, check every few seconds that Spotify is still on it.
+// If it moved on to another song in this playlist by itself, pause, so the phone never
+// plays a different song from the card. If you picked something else in Spotify, let it be.
+let watchTimer = null;
+function watchPlayback() {
+  clearInterval(watchTimer);
+  watchTimer = setInterval(async () => {
+    if (!nowPlaying || $("screen-swipe").classList.contains("hidden")) {
+      clearInterval(watchTimer);
+      return;
+    }
+    let st;
+    try { st = await api("/me/player?additional_types=track"); } catch { return; }
+    if (!nowPlaying) return;
+    if (!st || !st.item) { nowPlaying = null; stopAutoplay(); return; }
+    if (sameSong(st.item, nowPlaying)) {
+      if (!st.is_playing) stopAutoplay(); else $("play-btn").classList.add("on");
+      return;
+    }
+    const ours = st.context && st.context.uri === state.playlist.uri;
+    if (ours && st.is_playing && state.current && !sameSong(st.item, state.current)) {
+      await pausePlayback();
+      setStatus("play-status", "Paused: Spotify moved on to the next song. Press ▶ to hear this one.");
+    } else {
+      nowPlaying = null;
+      stopAutoplay();
+    }
+  }, 4000);
 }
 
 // Plays on the chosen device. If Spotify has lost it (the app was closed and reopened,
@@ -854,15 +953,18 @@ async function playOn(device, body) {
     const id = await browserReady();
     // Lets the browser start sound from this click (mobile Safari and Chrome need it).
     try { await browser.player.activateElement(); } catch { /* ignore */ }
-    return put(id);
+    await put(id);
+    return id;
   }
   try {
     await put(device.id);
+    return device.id;
   } catch (err) {
     if (err.status !== 404) throw err;
     const found = await loadDevices();
     if (!found) throw new ApiError(404, "device gone");
     await put(found.id);
+    return found.id;
   }
 }
 
