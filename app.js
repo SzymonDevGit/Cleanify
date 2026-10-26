@@ -329,7 +329,9 @@ async function fetchPlaylistSongs(id) {
   while (page) {
     for (const entry of page.items || []) {
       const t = entry.track || entry.item;
-      const uri = t && !t.is_local && t.uri ? t.uri : null;
+      // When Spotify swaps in another release of a song for your country ("relinking"),
+      // t.uri is the swapped-in one and linked_from holds the one in the playlist.
+      const uri = t && !t.is_local && t.uri ? (t.linked_from && t.linked_from.uri) || t.uri : null;
       entries.push({ uri, gone: false });
       if (!uri || seen.has(uri)) continue;
       seen.add(uri);
@@ -346,6 +348,8 @@ async function fetchPlaylistSongs(id) {
         album: album.name || "",
         isrc: (t.external_ids || {}).isrc || "",
         entry: entries.length - 1,
+        playUri: t.uri,
+        playable: t.is_playable !== false,
       });
     }
     page = page.next ? await api(page.next) : null;
@@ -577,6 +581,7 @@ function cardEl(t, cls) {
   c.append(art, el("h2", "", t.title), el("p", "artist", t.artists));
   const meta = el("div", "meta");
   for (const m of [ago(t.added), duration(t.duration)]) if (m) meta.append(el("span", "", m));
+  if (t.playable === false) meta.append(el("span", "warn-tag", "Can't play in your country"));
   c.append(meta);
   if (cls === "top") {
     c.append(el("div", "stamp keep", "KEEP"), el("div", "stamp bin", "REMOVE"));
@@ -854,26 +859,30 @@ function sameSong(item, t) {
 // After a play request, check Spotify really plays the card's song. Some phones ignore
 // the requested start song when shuffle is on, and some apps ignore single-song plays.
 // Phones can take a few seconds to report the new song, so give it up to 6 s.
+// Answers "ok", "wrong" (another song is playing) or "failed" (nothing loaded).
 async function confirmPlaying(t, seq) {
+  let empty = 0;
   for (let i = 0; i < 8; i++) {
     await sleep(i < 4 ? 500 : 1000);
-    if (seq !== playSeq) return true;
+    if (seq !== playSeq) return "ok";
     let st;
-    try { st = await api("/me/player?additional_types=track"); } catch { return true; }  // can't tell: trust it
-    if (st && st.item && sameSong(st.item, t)) return true;
+    try { st = await api("/me/player?additional_types=track"); } catch { return "ok"; }  // can't tell: trust it
+    if (st && st.item && sameSong(st.item, t)) return "ok";
+    if (st && !st.item && !st.is_playing) empty++;
   }
-  return false;
+  return empty >= 6 ? "failed" : "wrong";
 }
 
 // Waking a phone that isn't the active Spotify device: a play request sent straight to
 // it often just resumes its last song for a moment. Move playback there first (paused),
 // wait until Spotify says it's active, then ask for the song.
 async function makeActive(id) {
+  if (devices.some((d) => d.id === id && d.is_active)) return;
   let st = null;
   try { st = await api("/me/player"); } catch { /* ignore */ }
   if (st && st.device && st.device.id === id) return;
   try { await api("/me/player", { method: "PUT", body: { device_ids: [id], play: false } }); } catch { return; }
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 6; i++) {
     await sleep(500);
     try { st = await api("/me/player"); } catch { return; }
     if (st && st.device && st.device.id === id) return;
@@ -897,12 +906,17 @@ async function playCurrent() {
       return;
     }
   }
+  if (t.playable === false) {
+    await pausePlayback();
+    setStatus("play-status", "Spotify can't play this song on your account (it isn't available in your country). You can still keep or remove it.", "err");
+    return;
+  }
   const start = Math.min(30000, Math.floor((t.duration || 0) / 3));
   // Two ways to start a song. "song" plays just that song (it stops at the end, and
   // shuffle can't change it); "playlist" starts it inside the playlist, for Spotify apps
   // that ignore single-song requests. The way that worked is remembered per device.
   const ways = {
-    song: { uris: [t.uri], position_ms: start },
+    song: { uris: [t.playUri || t.uri], position_ms: start },
     playlist: { context_uri: state.playlist.uri, offset: { uri: t.uri }, position_ms: start },
   };
   const methods = store.get("cl_play_methods", {});
@@ -923,7 +937,13 @@ async function playCurrent() {
         continue;
       }
       if (seq !== playSeq) return;
-      if (await confirmPlaying(t, seq)) {
+      const result = await confirmPlaying(t, seq);
+      if (result === "failed") {
+        // The device tried and gave up: the song itself won't play. Starting it inside
+        // the playlist would only skip to the next song, so stop here.
+        throw new ApiError(0, `Spotify couldn't play "${t.title}" on ${device.name}. It may not be available in your country.`);
+      }
+      if (result === "ok") {
         if (seq !== playSeq) return;
         methods[device.name] = way;
         store.set("cl_play_methods", methods);
@@ -1012,7 +1032,7 @@ async function playOn(device, body) {
 }
 
 function playError(err) {
-  if (err.browser) return err.message;
+  if (err.browser || err.status === 0) return err.message;
   if (err.status === 404) return `Can't reach ${(savedDevice() || {}).name || "that device"}. Open Spotify on it, press ↻ next to Play on, then ▶.`;
   if (err.status === 403) return "Playing songs from here needs Spotify Premium. You can still swipe.";
   return `Couldn't play it: ${err.message}`;

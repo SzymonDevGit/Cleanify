@@ -94,6 +94,7 @@ input[type=checkbox] { accent-color: var(--green); }
 .card .artist { margin: 0; text-transform: uppercase; letter-spacing: 2px; font-size: 11px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .meta { margin-top: auto; display: flex; gap: 6px; flex-wrap: wrap; font-size: 11px; }
 .card .meta span { border: 1px solid var(--ink); border-radius: 12px; padding: 2px 8px; }
+.card .meta .warn-tag { border-color: var(--red); background: var(--red); color: var(--card); }
 .stamp { position: absolute; top: 26px; padding: 6px 12px; font-weight: 700; font-size: 20px; letter-spacing: 2px; color: var(--card); border-radius: 4px; opacity: 0; z-index: 3; pointer-events: none; }
 .stamp.keep { left: 20px; background: var(--green); transform: rotate(-12deg); }
 .stamp.bin { right: 20px; background: var(--red); transform: rotate(12deg); }
