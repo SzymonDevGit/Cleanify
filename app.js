@@ -246,7 +246,8 @@ async function api(path, { method = "GET", body } = {}, retried = false) {
     store.set(STRIKES_KEY, strikes);
     const secs = header > 0 ? header : Math.min(30 * 2 ** (strikes - 1), 600);
     store.set(WAIT_KEY, Date.now() + secs * 1000);
-    debug(`${method} ${short} -> 429, Retry-After ${raw === null ? "not readable" : raw}, waiting ${secs} s (strike ${strikes})`);
+    const said = (await res.text().catch(() => "")).slice(0, 200).replace(/\s+/g, " ");
+    debug(`${method} ${short} -> 429, Retry-After ${raw === null ? "not readable" : raw}, waiting ${secs} s (strike ${strikes}). Spotify said: ${said || "(nothing)"}`);
     throw tooManyError();
   }
   if (res.ok) store.remove(STRIKES_KEY);
