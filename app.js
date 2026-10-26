@@ -109,6 +109,8 @@ async function tokenRequest(body) {
 async function handleRedirect() {
   const params = new URLSearchParams(location.search);
   if (!params.has("code") && !params.has("error")) return;
+  store.remove("cl_me");  // a new sign-in may be another account
+  store.remove("cl_playlists");
   history.replaceState(null, "", REDIRECT_URI);
   if (params.get("error")) throw new Error(`Spotify sign-in was cancelled (${params.get("error")}).`);
   if (params.get("state") !== store.get("cl_state")) throw new Error("Sign-in check failed. Please try again.");
@@ -139,6 +141,8 @@ async function accessToken() {
 
 function logout() {
   store.remove("cl_token");
+  store.remove("cl_me");
+  store.remove("cl_playlists");
   location.reload();
 }
 
@@ -192,10 +196,31 @@ function describePlayer(st) {
     `${st.context ? " from " + st.context.uri : ""}${st.shuffle_state ? " (shuffle on)" : ""}`;
 }
 
+// When Spotify says "too many requests" it also says how long to wait. Asking again
+// before then only makes the wait longer, so every call is held back until it's over
+// (remembered across reloads and tabs).
+function coolDownLeft() {
+  return Math.max(0, store.get("cl_wait_until", 0) - Date.now());
+}
+
+function waitText(ms) {
+  const s = Math.ceil(ms / 1000);
+  if (s < 90) return `${s} seconds`;
+  const m = Math.ceil(s / 60);
+  if (m < 90) return `${m} minutes`;
+  const at = new Date(Date.now() + ms);
+  return `until ${at.getHours()}:${String(at.getMinutes()).padStart(2, "0")}`;
+}
+
+function tooManyError() {
+  return new ApiError(429, `Spotify has paused this app for asking too often. Cleanify will wait ${waitText(coolDownLeft())} before trying again. Closing other Cleanify tabs helps.`);
+}
+
 async function api(path, { method = "GET", body } = {}, retried = false) {
   const url = path.startsWith("http") ? path : "https://api.spotify.com/v1" + path;
   const short = url.replace("https://api.spotify.com/v1", "");
   const logIt = short.startsWith("/me/player");
+  if (coolDownLeft()) throw tooManyError();
   const res = await fetch(url, {
     method,
     headers: {
@@ -211,9 +236,16 @@ async function api(path, { method = "GET", body } = {}, retried = false) {
     return api(path, { method, body }, true);
   }
   if (res.status === 429) {
-    if (logIt) debug(`${method} ${short} -> 429`);
-    throw new ApiError(429, "Spotify is getting too many requests right now. Wait a minute and try again.");
+    // Retry-After is in seconds; if the browser can't read it, back off 30 s, doubling.
+    const header = Number(res.headers.get("Retry-After"));
+    const strikes = store.get("cl_429s", 0) + 1;
+    store.set("cl_429s", strikes);
+    const secs = header > 0 ? header : Math.min(30 * 2 ** (strikes - 1), 3600);
+    store.set("cl_wait_until", Date.now() + secs * 1000);
+    debug(`${method} ${short} -> 429, waiting ${secs} s${header > 0 ? " (Spotify's Retry-After)" : ""}`);
+    throw tooManyError();
   }
+  if (res.ok) store.remove("cl_429s");
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     const message = (data.error && data.error.message) || `Spotify request failed (${res.status})`;
@@ -484,16 +516,33 @@ function duration(ms) {
 }
 
 // --- Playlists ---
-async function showPlaylists() {
+// The list is kept for 10 minutes so going back and forth doesn't ask Spotify again;
+// Refresh list always does.
+const LIST_CACHE_MS = 10 * 60 * 1000;
+async function showPlaylists(force = false) {
   showScreen("playlists");
   stopAutoplay();
+  clearInterval(watchTimer);
+  const cached = store.get("cl_playlists");
+  if (!force && cached && cached.user === state.me.id && Date.now() - cached.at < LIST_CACHE_MS) {
+    state.playlists = cached.list;
+    renderPlaylists();
+    setStatus("playlists-status", "");
+    return;
+  }
   setStatus("playlists-status", "Loading your playlists…");
   try {
     state.playlists = await fetchPlaylists(state.me);
+    store.set("cl_playlists", { user: state.me.id, at: Date.now(), list: state.playlists });
     renderPlaylists();
     setStatus("playlists-status", state.playlists.length ? "" : "You have no playlists of your own yet.");
   } catch (err) {
     setStatus("playlists-status", err.message, "err");
+    // Try again by itself once a short wait is over.
+    const wait = coolDownLeft();
+    if (err.status === 429 && wait && wait < 5 * 60 * 1000) {
+      setTimeout(() => { if (!$("screen-playlists").classList.contains("hidden")) showPlaylists(true); }, wait + 500);
+    }
   }
 }
 
@@ -862,15 +911,15 @@ function sameSong(item, t) {
 // Answers "ok", "wrong" (another song is playing) or "failed" (nothing loaded).
 async function confirmPlaying(t, seq) {
   let empty = 0;
-  for (let i = 0; i < 8; i++) {
-    await sleep(i < 4 ? 500 : 1000);
+  for (let i = 0; i < 5; i++) {
+    await sleep(i < 2 ? 700 : 1500);
     if (seq !== playSeq) return "ok";
     let st;
     try { st = await api("/me/player?additional_types=track"); } catch { return "ok"; }  // can't tell: trust it
     if (st && st.item && sameSong(st.item, t)) return "ok";
     if (st && !st.item && !st.is_playing) empty++;
   }
-  return empty >= 6 ? "failed" : "wrong";
+  return empty >= 4 ? "failed" : "wrong";
 }
 
 // Waking a phone that isn't the active Spotify device: a play request sent straight to
@@ -988,6 +1037,7 @@ function watchPlayback() {
       clearInterval(watchTimer);
       return;
     }
+    if (document.hidden || coolDownLeft()) return;  // no checks from a tab you aren't looking at
     let st;
     try { st = await api("/me/player?additional_types=track"); } catch { return; }
     if (!nowPlaying) return;
@@ -1004,7 +1054,7 @@ function watchPlayback() {
       nowPlaying = null;
       stopAutoplay();
     }
-  }, 4000);
+  }, 10000);
 }
 
 // Plays on the chosen device. If Spotify has lost it (the app was closed and reopened,
@@ -1362,7 +1412,7 @@ function wire() {
   $("own-save").addEventListener("click", onOwnAppSave);
   $("own-id").addEventListener("keydown", (e) => { if (e.key === "Enter") onOwnAppSave(); });
   $("logout-link").addEventListener("click", (e) => { e.preventDefault(); logout(); });
-  $("refresh-btn").addEventListener("click", showPlaylists);
+  $("refresh-btn").addEventListener("click", () => showPlaylists(true));
   $("back-link").addEventListener("click", (e) => { e.preventDefault(); showPlaylists(); });
   $("bin-btn").addEventListener("click", () => decide("remove"));
   $("keep-btn").addEventListener("click", () => decide("keep"));
@@ -1411,7 +1461,8 @@ async function main() {
   }
   if (!CLIENT_ID || !store.get("cl_token")) return showScreen("login");
   try {
-    state.me = await api("/me");
+    state.me = store.get("cl_me") || await api("/me");
+    store.set("cl_me", state.me);
     $("user-name").textContent = state.me.display_name || state.me.id;
     await showPlaylists();
   } catch (err) {
