@@ -316,6 +316,8 @@ async function fetchPlaylistSongs(id) {
         thumb: pickImage(album.images || t.images, true),
         added: entry.added_at || "",
         duration: t.duration_ms || 0,
+        album: album.name || "",
+        isrc: (t.external_ids || {}).isrc || "",
         entry: entries.length - 1,
       });
     }
@@ -334,6 +336,7 @@ function loadMemory(id) {
     removed: m.removed || [],    // {uri, title, artists, year, cover, thumb, added, duration, pos}
     history: m.history || [],    // {uri, dec: "keep" | "remove"}
     backup: m.backup || null,
+    dupesSeen: m.dupesSeen || [],  // duplicate groups already shown, so they don't pop up every visit
   };
 }
 
@@ -499,6 +502,9 @@ async function openPlaylist(p) {
     render();
     loadDevices();
     if ($("backup").checked && !state.mem.backup && tracks.length) await makeBackup();
+    // New duplicates (ones not shown on an earlier visit) are listed before swiping.
+    const groups = findDuplicates();
+    if (groups.some((g) => !state.mem.dupesSeen.includes(g.key))) showDupes(groups);
   } catch (err) {
     setStatus("playlists-status", err.message, "err");
   }
@@ -610,23 +616,30 @@ function decide(dec, fromDrag) {
   if (dec === "keep") {
     state.mem.kept.push(t.uri);
   } else {
-    const pos = currentPosition(t);
-    setGone(t.uri, true);
-    const { entry, ...saved } = t;
-    state.mem.removed.push({ ...saved, pos });
-    enqueue(() => removeFromPlaylist(state.playlist.id, [t.uri])).catch((err) => {
-      // It's still in the playlist: undo the swipe so the screen matches Spotify.
-      setGone(t.uri, false);
-      state.mem.removed = state.mem.removed.filter((r) => r.uri !== t.uri);
-      state.mem.history = state.mem.history.filter((h) => !(h.uri === t.uri && h.dec === "remove"));
-      saveMemory();
-      render();
-      showScreen("swipe");
-      setStatus("play-status", `Couldn't remove "${t.title}": ${removeError(err)}`, "err");
-    });
+    removeTrack(t).catch(() => {});  // removeTrack shows the error
   }
   saveMemory();
   render();
+}
+
+// Takes a song (every copy of it) out of the playlist and into the bargain bin.
+// The caller has already added the undo step.
+function removeTrack(t) {
+  const pos = currentPosition(t);
+  setGone(t.uri, true);
+  const { entry, ...saved } = t;
+  state.mem.removed.push({ ...saved, pos });
+  return enqueue(() => removeFromPlaylist(state.playlist.id, [t.uri])).catch((err) => {
+    // It's still in the playlist: undo the swipe so the screen matches Spotify.
+    setGone(t.uri, false);
+    state.mem.removed = state.mem.removed.filter((r) => r.uri !== t.uri);
+    state.mem.history = state.mem.history.filter((h) => !(h.uri === t.uri && h.dec === "remove"));
+    saveMemory();
+    render();
+    showScreen("swipe");
+    setStatus("play-status", `Couldn't remove "${t.title}": ${removeError(err)}`, "err");
+    throw err;
+  });
 }
 
 function removeError(err) {
@@ -657,6 +670,19 @@ async function undo() {
   if (last.dec === "keep") {
     state.mem.kept = state.mem.kept.filter((u) => u !== last.uri);
     saveMemory();
+    render();
+    return;
+  }
+  if (last.dec === "extras") {
+    setStatus("play-status", "Putting the extra copies back…");
+    try {
+      await restoreExtras(last);
+      setStatus("play-status", "The extra copies are back in the playlist.", "ok");
+    } catch (err) {
+      state.mem.history.push(last);
+      saveMemory();
+      setStatus("play-status", `Couldn't put them back: ${err.message}`, "err");
+    }
     render();
     return;
   }
@@ -906,6 +932,183 @@ function browserReady() {
   });
 }
 
+// --- Duplicates ---
+// Version words that don't make it a different song: "Mr. Brightside - Remastered 2019",
+// "Toxic (Radio Edit)", "Hey Ya! [Live]", "Song (feat. Someone)".
+const VERSION_WORDS = /\b(remaster(ed)?|live|version|edit|mix|remix|mono|stereo|deluxe|radio|explicit|clean|feat|ft|featuring|with|acoustic|demo|anniversary|bonus|single|album|original|extended|from|soundtrack|session|recorded|re-?recorded|taylor'?s|\d{4})\b/;
+
+function plain(text) {
+  return (text || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function songKey(t) {
+  let title = plain(t.title)
+    .replace(/\s*[([]([^)\]]*)[)\]]/g, (m, inner) => (VERSION_WORDS.test(inner) ? "" : m))
+    .replace(/\s+[-–—]\s+(.*)$/, (m, rest) => (VERSION_WORDS.test(rest) ? "" : m))
+    .replace(/\s(feat|ft)\.?\s.*$/, "")
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  const artist = plain(t.artists.split(",")[0]).replace(/^the\s+/, "").replace(/[^a-z0-9]+/g, " ").trim();
+  return title ? `${title}|${artist}` : "";
+}
+
+function copiesOf(t) {
+  return state.entries.filter((e) => e.uri === t.uri && !e.gone).length;
+}
+
+// Groups of songs still in the playlist that look like the same song: the same track
+// added twice, the same recording on another release (same ISRC code), or the same
+// title and main artist once version words are taken off.
+function findDuplicates() {
+  const live = state.tracks.filter((t) => !isGone(t));
+  const parent = live.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const byKey = new Map();
+  live.forEach((t, i) => {
+    for (const k of [songKey(t), t.isrc && "isrc:" + t.isrc]) {
+      if (!k) continue;
+      if (byKey.has(k)) parent[find(i)] = find(byKey.get(k));
+      else byKey.set(k, i);
+    }
+  });
+  const groups = new Map();
+  live.forEach((t, i) => {
+    const root = find(i);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(t);
+  });
+  return [...groups.values()]
+    .filter((g) => g.length > 1 || copiesOf(g[0]) > 1)
+    .map((tracks) => ({ tracks, key: tracks.map((t) => t.uri).sort().join(" ") + ` x${tracks.reduce((n, t) => n + copiesOf(t), 0)}` }));
+}
+
+let dupeGroups = [];
+function showDupes(groups = findDuplicates()) {
+  dupeGroups = groups;
+  const box = $("dupe-list");
+  box.textContent = "";
+  $("dupes-intro").textContent = groups.length
+    ? `${groups.length} song${groups.length === 1 ? " is" : "s are"} in ${state.playlist.name} more than once. Ticked ones get removed (they go to the bargain bin, and Undo works).`
+    : `No duplicates in ${state.playlist.name}.`;
+  for (const g of groups) {
+    const wrap = el("div", "dgroup");
+    wrap.append(el("h3", "", g.tracks[0].title));
+    g.tracks.forEach((t, i) => {
+      const row = el("label", "drow");
+      const box = el("input");
+      box.type = "checkbox";
+      box.checked = i > 0;  // keep the first one in the playlist
+      box.dataset.uri = t.uri;
+      box.dataset.kind = "song";
+      const text = el("div", "t");
+      const info = [t.artists, t.album, t.year, duration(t.duration)].filter(Boolean).join(" · ");
+      text.append(el("b", "", t.title), el("span", "", info));
+      row.append(box, thumbEl(t.thumb), text, el("span", "dtag", ""));
+      wrap.append(row);
+      const copies = copiesOf(t);
+      if (copies > 1) {
+        const extra = el("label", "drow extra");
+        const xbox = el("input");
+        xbox.type = "checkbox";
+        xbox.checked = true;
+        xbox.dataset.uri = t.uri;
+        xbox.dataset.kind = "extras";
+        extra.append(xbox, el("span", "", `This exact song is in the playlist ${copies} times. Remove the ${copies - 1} extra cop${copies === 2 ? "y" : "ies"}`));
+        wrap.append(extra);
+      }
+    });
+    box.append(wrap);
+  }
+  box.querySelectorAll("input").forEach((i) => i.addEventListener("change", updateDupeButton));
+  updateDupeButton();
+  setStatus("dupes-status", "");
+  showScreen("dupes");
+}
+
+function dupePicks() {
+  return [...$("dupe-list").querySelectorAll("input:checked")].map((i) => ({ uri: i.dataset.uri, kind: i.dataset.kind }));
+}
+
+function updateDupeButton() {
+  // A song that's removed takes its extra copies with it, so they aren't counted twice.
+  const picks = dupePicks();
+  const songs = new Set(picks.filter((p) => p.kind === "song").map((p) => p.uri));
+  let n = songs.size;
+  for (const p of picks) if (p.kind === "extras" && !songs.has(p.uri)) n += copiesOf(trackByUri(p.uri)) - 1;
+  $("dupe-remove").disabled = !n;
+  $("dupe-remove").textContent = n ? `Remove ${n} song${n === 1 ? "" : "s"}` : "Nothing ticked";
+  $("dupe-list").querySelectorAll(".drow:not(.extra)").forEach((row) => {
+    row.querySelector(".dtag").textContent = row.querySelector("input").checked ? "remove" : "keep";
+    row.classList.toggle("going", row.querySelector("input").checked);
+  });
+}
+
+function markDupesSeen() {
+  state.mem.dupesSeen = [...new Set([...state.mem.dupesSeen, ...dupeGroups.map((g) => g.key)])].slice(-500);
+  saveMemory();
+}
+
+async function removeDupes() {
+  const picks = dupePicks();
+  const songs = new Set(picks.filter((p) => p.kind === "song").map((p) => p.uri));
+  $("dupe-remove").disabled = true;
+  setStatus("dupes-status", "Removing…");
+  const jobs = [];
+  for (const uri of songs) {
+    const t = trackByUri(uri);
+    state.mem.history.push({ uri, dec: "remove" });
+    jobs.push(removeTrack(t));
+  }
+  for (const p of picks) if (p.kind === "extras" && !songs.has(p.uri)) jobs.push(removeExtras(trackByUri(p.uri)));
+  markDupesSeen();
+  saveMemory();
+  const results = await Promise.allSettled(jobs);
+  const failed = results.filter((r) => r.status === "rejected");
+  if (failed.length) {
+    setStatus("dupes-status", `${failed.length} couldn't be removed: ${removeError(failed[0].reason)}`, "err");
+    showDupes();
+    return;
+  }
+  showScreen("swipe");
+  render();
+  setStatus("play-status", "Duplicates removed. Undo puts them back one at a time.", "ok");
+}
+
+// Keeps one copy of a song that was added more than once. Spotify removes every copy of a
+// song at once, so: remove it, then add one copy back where the first one was.
+function removeExtras(t) {
+  const extra = [];
+  state.entries.forEach((e, i) => { if (e.uri === t.uri && !e.gone && i !== t.entry) extra.push(i); });
+  if (!extra.length) return Promise.resolve();
+  const step = { uri: t.uri, dec: "extras", entries: extra };
+  state.mem.history.push(step);
+  extra.forEach((i) => { state.entries[i].gone = true; });
+  return enqueue(async () => {
+    const pos = currentPosition(t);
+    await removeFromPlaylist(state.playlist.id, [t.uri]);
+    await addToPlaylist(state.playlist.id, [t.uri], pos);
+  }).catch((err) => {
+    extra.forEach((i) => { state.entries[i].gone = false; });
+    state.mem.history = state.mem.history.filter((h) => h !== step);
+    saveMemory();
+    throw err;
+  });
+}
+
+function restoreExtras(step) {
+  return enqueue(async () => {
+    for (const i of [...step.entries].sort((a, b) => a - b)) {
+      if (!state.entries[i] || state.entries[i].uri !== step.uri) continue;
+      let pos = 0;
+      for (let j = 0; j < i; j++) if (!state.entries[j].gone) pos++;
+      await addToPlaylist(state.playlist.id, [step.uri], pos);
+      state.entries[i].gone = false;
+    }
+    saveMemory();
+  });
+}
+
 // --- Bargain bin ---
 function showBin() {
   const n = state.mem.removed.length;
@@ -989,6 +1192,9 @@ function wire() {
   $("done-bin").addEventListener("click", showBin);
   $("again-btn").addEventListener("click", showPlaylists);
   $("restart-btn").addEventListener("click", restartPlaylist);
+  $("dupes-link").addEventListener("click", () => showDupes());
+  $("dupe-remove").addEventListener("click", removeDupes);
+  $("dupe-skip").addEventListener("click", () => { markDupesSeen(); showScreen("swipe"); render(); });
 
   $("autoplay").checked = store.get("cl_autoplay", false);
   $("autoplay").addEventListener("change", () => {

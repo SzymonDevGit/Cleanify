@@ -78,6 +78,20 @@
         <span>In the crate: <b id="keep-count">0</b></span>
       </div>
       <p class="hint">← swipe left to remove · swipe right to keep →<br>Removed songs leave the playlist straight away. Undo puts them back.</p>
+      <button id="dupes-link" class="linkish center">Find duplicates</button>
+    </section>
+
+    <!-- Duplicates: shown before swiping when a playlist has songs in it more than once -->
+    <section id="screen-dupes" class="screen hidden">
+      <header class="top">
+        <h1 class="logo">Cleanify</h1>
+      </header>
+      <h2 class="rule">Doubles in the crate</h2>
+      <p id="dupes-intro" class="small"></p>
+      <div id="dupe-list" class="dupes"></div>
+      <button id="dupe-remove" class="btn danger wide"></button>
+      <button id="dupe-skip" class="btn ghost wide">Skip, start swiping</button>
+      <p id="dupes-status" class="status"></p>
     </section>
 
     <!-- Bargain bin: songs removed from this playlist, each can be put back -->

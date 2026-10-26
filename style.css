@@ -111,6 +111,23 @@ input[type=checkbox] { accent-color: var(--green); }
 .tally b { font-family: "Abril Fatface", serif; font-weight: 400; font-size: 18px; color: var(--red); letter-spacing: 0; }
 .hint { text-align: center; font-size: 12px; color: var(--muted); margin: 0; }
 
+/* Duplicates */
+.dupes { display: flex; flex-direction: column; gap: 12px; }
+.dgroup { background: var(--card); border: 1px solid var(--line); padding: 8px 10px 10px; }
+.dgroup h3 { font-family: "Abril Fatface", serif; font-weight: 400; font-size: 18px; margin: 2px 0 6px; }
+.drow { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px dashed var(--line); cursor: pointer; }
+.drow input { width: 18px; height: 18px; flex: none; accent-color: var(--red); }
+.drow .thumb { width: 40px; height: 40px; }
+.drow .t { flex: 1; min-width: 0; }
+.drow .t b, .drow .t span { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.drow .t span { font-size: 12px; color: var(--muted); }
+.drow .t b, .drow .t span { white-space: normal; }
+.drow.going .t b { text-decoration: line-through; color: var(--muted); }
+.dtag { flex: none; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; padding: 2px 8px; border-radius: 10px; background: var(--green); color: var(--card); }
+.drow.going .dtag { background: var(--red); }
+.drow.extra { font-size: 13px; padding-left: 4px; }
+.linkish.center { align-self: center; }
+
 /* Review */
 .binlist li { display: flex; align-items: center; gap: 10px; background: var(--card); border: 1px solid var(--line); padding: 6px; }
 .binlist .thumb { width: 44px; height: 44px; }
