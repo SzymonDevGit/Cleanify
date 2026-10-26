@@ -202,8 +202,17 @@ function describePlayer(st) {
 // Kept per Client ID: each Spotify app has its own limit, so a new app starts fresh.
 const WAIT_KEY = "cl_wait_until_" + CLIENT_ID;
 const STRIKES_KEY = "cl_429s_" + CLIENT_ID;
+// Since July 2026 Spotify also gives each developer account a usage allowance shared by
+// all its apps in Development Mode. Running out answers 429 with reason QUOTA_EXCEEDED,
+// and it comes back many hours later, so a new Client ID doesn't help. That wait is kept
+// for every Client ID, and Cleanify only checks again every 30 minutes.
+const QUOTA_KEY = "cl_quota_until";
+const QUOTA_CHECK_MS = 30 * 60 * 1000;
+function quotaLeft() {
+  return Math.max(0, store.get(QUOTA_KEY, 0) - Date.now());
+}
 function coolDownLeft() {
-  return Math.max(0, store.get(WAIT_KEY, 0) - Date.now());
+  return Math.max(0, store.get(WAIT_KEY, 0) - Date.now(), quotaLeft());
 }
 
 function waitText(ms) {
@@ -216,6 +225,9 @@ function waitText(ms) {
 }
 
 function tooManyError() {
+  if (quotaLeft()) {
+    return new ApiError(429, `Spotify says your developer account has used up its allowance for now. It's shared by all your Spotify apps (Jukemonster too), so a new Client ID won't help. It usually comes back after 13 to 18 hours. Cleanify will check again in ${waitText(quotaLeft())}.`);
+  }
   return new ApiError(429, `Spotify has paused your Spotify app for asking too often, so Cleanify will wait ${waitText(coolDownLeft())} before trying again. The limit is shared by everything using the same Client ID: Cleanify on other devices or tabs, and Jukemonster if it uses the same app.`);
 }
 
@@ -247,6 +259,7 @@ async function api(path, { method = "GET", body } = {}, retried = false) {
     const secs = header > 0 ? header : Math.min(30 * 2 ** (strikes - 1), 600);
     store.set(WAIT_KEY, Date.now() + secs * 1000);
     const said = (await res.text().catch(() => "")).slice(0, 200).replace(/\s+/g, " ");
+    if (/QUOTA_EXCEEDED/.test(said)) store.set(QUOTA_KEY, Date.now() + Math.max(QUOTA_CHECK_MS, secs * 1000));
     debug(`${method} ${short} -> 429, Retry-After ${raw === null ? "not readable" : raw}, waiting ${secs} s (strike ${strikes}). Spotify said: ${said || "(nothing)"}`);
     throw tooManyError();
   }
@@ -1420,7 +1433,8 @@ function wire() {
   $("own-save").addEventListener("click", onOwnAppSave);
   $("own-id").addEventListener("keydown", (e) => { if (e.key === "Enter") onOwnAppSave(); });
   $("logout-link").addEventListener("click", (e) => { e.preventDefault(); logout(); });
-  $("refresh-btn").addEventListener("click", () => showPlaylists(true));
+  // Refresh list is the "try now" button: it skips the long allowance wait (one request).
+  $("refresh-btn").addEventListener("click", () => { store.remove(QUOTA_KEY); showPlaylists(true); });
   $("back-link").addEventListener("click", (e) => { e.preventDefault(); showPlaylists(); });
   $("bin-btn").addEventListener("click", () => decide("remove"));
   $("keep-btn").addEventListener("click", () => decide("keep"));
