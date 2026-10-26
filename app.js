@@ -199,8 +199,11 @@ function describePlayer(st) {
 // When Spotify says "too many requests" it also says how long to wait. Asking again
 // before then only makes the wait longer, so every call is held back until it's over
 // (remembered across reloads and tabs).
+// Kept per Client ID: each Spotify app has its own limit, so a new app starts fresh.
+const WAIT_KEY = "cl_wait_until_" + CLIENT_ID;
+const STRIKES_KEY = "cl_429s_" + CLIENT_ID;
 function coolDownLeft() {
-  return Math.max(0, store.get("cl_wait_until", 0) - Date.now());
+  return Math.max(0, store.get(WAIT_KEY, 0) - Date.now());
 }
 
 function waitText(ms) {
@@ -239,14 +242,14 @@ async function api(path, { method = "GET", body } = {}, retried = false) {
     // Retry-After is in seconds; if the browser can't read it, back off 30 s, doubling.
     const raw = res.headers.get("Retry-After");
     const header = Number(raw);
-    const strikes = store.get("cl_429s", 0) + 1;
-    store.set("cl_429s", strikes);
-    const secs = header > 0 ? header : Math.min(30 * 2 ** (strikes - 1), 3600);
-    store.set("cl_wait_until", Date.now() + secs * 1000);
+    const strikes = store.get(STRIKES_KEY, 0) + 1;
+    store.set(STRIKES_KEY, strikes);
+    const secs = header > 0 ? header : Math.min(30 * 2 ** (strikes - 1), 600);
+    store.set(WAIT_KEY, Date.now() + secs * 1000);
     debug(`${method} ${short} -> 429, Retry-After ${raw === null ? "not readable" : raw}, waiting ${secs} s (strike ${strikes})`);
     throw tooManyError();
   }
-  if (res.ok) store.remove("cl_429s");
+  if (res.ok) store.remove(STRIKES_KEY);
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     const message = (data.error && data.error.message) || `Spotify request failed (${res.status})`;
@@ -1331,7 +1334,7 @@ async function copyDetails() {
     `Cleanify details, ${new Date().toISOString()}`,
     `Browser: ${navigator.userAgent}`,
     `Play on: ${device ? device.name : "(none)"}; ways that worked: ${JSON.stringify(store.get("cl_play_methods", {}))}`,
-    `Client ID: …${CLIENT_ID.slice(-4)}; waiting: ${waitText(coolDownLeft())}; 429s in a row: ${store.get("cl_429s", 0)}`,
+    `Client ID: …${CLIENT_ID.slice(-4)}; waiting: ${waitText(coolDownLeft())}; 429s in a row: ${store.get(STRIKES_KEY, 0)}`,
     `Card: ${state.current ? `${state.current.title} (${state.current.uri})` : "(none)"}`,
     `Permissions: ${(store.get("cl_token") || {}).scope || "(not recorded)"}`,
     "",
@@ -1410,6 +1413,8 @@ function restartPlaylist() {
 // Start-up
 // ---------------------------------------------------------------------
 function wire() {
+  store.remove("cl_wait_until");  // from before the wait was kept per Client ID
+  store.remove("cl_429s");
   $("login-btn").addEventListener("click", startLogin);
   $("own-save").addEventListener("click", onOwnAppSave);
   $("own-id").addEventListener("keydown", (e) => { if (e.key === "Enter") onOwnAppSave(); });
