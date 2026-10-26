@@ -213,13 +213,13 @@ function waitText(ms) {
 }
 
 function tooManyError() {
-  return new ApiError(429, `Spotify has paused this app for asking too often. Cleanify will wait ${waitText(coolDownLeft())} before trying again. Closing other Cleanify tabs helps.`);
+  return new ApiError(429, `Spotify has paused your Spotify app for asking too often, so Cleanify will wait ${waitText(coolDownLeft())} before trying again. The limit is shared by everything using the same Client ID: Cleanify on other devices or tabs, and Jukemonster if it uses the same app.`);
 }
 
 async function api(path, { method = "GET", body } = {}, retried = false) {
   const url = path.startsWith("http") ? path : "https://api.spotify.com/v1" + path;
   const short = url.replace("https://api.spotify.com/v1", "");
-  const logIt = short.startsWith("/me/player");
+  const logIt = true;
   if (coolDownLeft()) throw tooManyError();
   const res = await fetch(url, {
     method,
@@ -237,12 +237,13 @@ async function api(path, { method = "GET", body } = {}, retried = false) {
   }
   if (res.status === 429) {
     // Retry-After is in seconds; if the browser can't read it, back off 30 s, doubling.
-    const header = Number(res.headers.get("Retry-After"));
+    const raw = res.headers.get("Retry-After");
+    const header = Number(raw);
     const strikes = store.get("cl_429s", 0) + 1;
     store.set("cl_429s", strikes);
     const secs = header > 0 ? header : Math.min(30 * 2 ** (strikes - 1), 3600);
     store.set("cl_wait_until", Date.now() + secs * 1000);
-    debug(`${method} ${short} -> 429, waiting ${secs} s${header > 0 ? " (Spotify's Retry-After)" : ""}`);
+    debug(`${method} ${short} -> 429, Retry-After ${raw === null ? "not readable" : raw}, waiting ${secs} s (strike ${strikes})`);
     throw tooManyError();
   }
   if (res.ok) store.remove("cl_429s");
@@ -1330,6 +1331,7 @@ async function copyDetails() {
     `Cleanify details, ${new Date().toISOString()}`,
     `Browser: ${navigator.userAgent}`,
     `Play on: ${device ? device.name : "(none)"}; ways that worked: ${JSON.stringify(store.get("cl_play_methods", {}))}`,
+    `Client ID: …${CLIENT_ID.slice(-4)}; waiting: ${waitText(coolDownLeft())}; 429s in a row: ${store.get("cl_429s", 0)}`,
     `Card: ${state.current ? `${state.current.title} (${state.current.uri})` : "(none)"}`,
     `Permissions: ${(store.get("cl_token") || {}).scope || "(not recorded)"}`,
     "",
@@ -1337,7 +1339,7 @@ async function copyDetails() {
   ].join("\n");
   try {
     await navigator.clipboard.writeText(text);
-    setStatus("play-status", "Details copied. Paste them in the chat.", "ok");
+    setStatus($("screen-swipe").classList.contains("hidden") ? "playlists-status" : "play-status", "Details copied. Paste them in the chat.", "ok");
   } catch {
     window.prompt("Copy this:", text);
   }
@@ -1418,6 +1420,7 @@ function wire() {
   $("keep-btn").addEventListener("click", () => decide("keep"));
   $("play-btn").addEventListener("click", playCurrent);
   $("copy-details").addEventListener("click", copyDetails);
+  $("copy-details-list").addEventListener("click", copyDetails);
   $("device-select").addEventListener("change", onPickDevice);
   $("device-refresh").addEventListener("click", loadDevices);
   $("undo-btn").addEventListener("click", undo);
