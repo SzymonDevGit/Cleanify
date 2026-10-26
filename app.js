@@ -21,7 +21,11 @@ const SCOPES = [
   "playlist-modify-public",
   "user-read-playback-state",
   "user-modify-playback-state",
+  "streaming",          // the "This browser" player
+  "user-read-email",
+  "user-read-private",
 ].join(" ");
+const BROWSER = "browser";      // the "Play on" value for this tab's own player
 // Must match a Redirect URI in the Spotify dashboard exactly.
 const REDIRECT_URI = location.origin + location.pathname.replace(/index\.html$/, "");
 const SWIPE_DISTANCE = 100;   // px a card must be dragged to count as a swipe
@@ -84,6 +88,7 @@ function saveToken(data) {
   const token = {
     access: data.access_token,
     refresh: data.refresh_token || (store.get("cl_token") || {}).refresh,
+    scope: data.scope || (store.get("cl_token") || {}).scope || "",
     expires: Date.now() + (data.expires_in - 60) * 1000,
   };
   store.set("cl_token", token);
@@ -721,35 +726,49 @@ async function loadDevices() {
     devices = [];
   }
   const saved = savedDevice();
+  if (saved && saved.id === BROWSER) startBrowserPlayer();
   // Device ids can change when an app restarts; the name is a good second guess.
-  const match = saved && (devices.find((d) => d.id === saved.id) || devices.find((d) => d.name === saved.name));
-  if (match && match.id !== saved.id) store.set("cl_device", { id: match.id, name: match.name });
+  const match = saved && saved.id === BROWSER ? saved : saved && (devices.find((d) => d.id === saved.id) || devices.find((d) => d.name === saved.name));
+  if (match && match.id !== saved.id && saved.id !== BROWSER) store.set("cl_device", { id: match.id, name: match.name });
   select.textContent = "";
   const first = el("option", "", devices.length ? "Pick a speaker…" : "No Spotify devices found");
   first.value = "";
   select.append(first);
+  devices = devices.filter((d) => d.id !== browser.id && d.name !== "Cleanify");
+  const b = el("option", "", "This browser (plays in this tab)");
+  b.value = BROWSER;
+  select.append(b);
   for (const d of devices) {
     const o = el("option", "", `${d.name} (${(d.type || "device").toLowerCase()})${d.is_active ? " · playing" : ""}`);
     o.value = d.id;
     select.append(o);
   }
-  if (saved && !match) {
+  if (saved && !match && saved.id !== BROWSER) {
     const o = el("option", "", `${saved.name} (not open right now)`);
     o.value = saved.id;
     select.append(o);
-  }
-  // Only one device open: no need to ask.
-  if (!saved && devices.length === 1) {
-    store.set("cl_device", { id: devices[0].id, name: devices[0].name });
-    select.value = devices[0].id;
-    return devices[0];
   }
   select.value = saved ? (match ? match.id : saved.id) : "";
   return match || null;
 }
 
 function onPickDevice() {
-  const d = devices.find((x) => x.id === $("device-select").value);
+  const value = $("device-select").value;
+  if (value === BROWSER) {
+    $("device-select").blur();
+    store.set("cl_device", { id: BROWSER, name: "This browser" });
+    // Tokens from before this option existed can't stream: sign in once more.
+    if (!/\bstreaming\b/.test((store.get("cl_token") || {}).scope || "")) {
+      setStatus("play-status", "Signing in again so this browser can play music…");
+      startLogin();
+      return;
+    }
+    startBrowserPlayer();
+    setStatus("play-status", "");
+    if (autoplay()) playCurrent();
+    return;
+  }
+  const d = devices.find((x) => x.id === value);
   $("device-select").blur();  // so the arrow keys swipe again
   if (d) store.set("cl_device", { id: d.id, name: d.name });
   else store.remove("cl_device");
@@ -805,6 +824,12 @@ async function playCurrent() {
 // so its id changed), look it up again by name once.
 async function playOn(device, body) {
   const put = (id) => api(`/me/player/play?device_id=${encodeURIComponent(id)}`, { method: "PUT", body });
+  if (device.id === BROWSER) {
+    const id = await browserReady();
+    // Lets the browser start sound from this click (mobile Safari and Chrome need it).
+    try { await browser.player.activateElement(); } catch { /* ignore */ }
+    return put(id);
+  }
   try {
     await put(device.id);
   } catch (err) {
@@ -816,9 +841,69 @@ async function playOn(device, body) {
 }
 
 function playError(err) {
+  if (err.browser) return err.message;
   if (err.status === 404) return `Can't reach ${(savedDevice() || {}).name || "that device"}. Open Spotify on it, press ↻ next to Play on, then ▶.`;
   if (err.status === 403) return "Playing songs from here needs Spotify Premium. You can still swipe.";
   return `Couldn't play it: ${err.message}`;
+}
+
+// --- "This browser": Spotify's Web Playback SDK, loaded only when picked ---
+const browser = { id: null, player: null, problem: "", waiters: [] };
+
+function browserProblem(text) {
+  browser.problem = text;
+  browser.id = null;
+  browser.waiters.splice(0).forEach((w) => w.reject(Object.assign(new Error(text), { browser: true })));
+  setStatus("play-status", text, "err");
+}
+
+function startBrowserPlayer() {
+  if (browser.started) return;
+  browser.started = true;
+  if (/Firefox\//.test(navigator.userAgent)) {
+    browserProblem("Spotify won't play songs inside Firefox or Zen. Use Chrome or Edge, or pick your Spotify app under Play on.");
+    return;
+  }
+  window.onSpotifyWebPlaybackSDKReady = () => {
+    const player = new Spotify.Player({
+      name: "Cleanify",
+      getOAuthToken: (cb) => accessToken().then(cb).catch(() => browserProblem("This browser couldn't sign in to play music. Sign out and in again, or pick another device.")),
+      volume: 0.8,
+    });
+    player.addListener("ready", ({ device_id }) => {
+      browser.id = device_id;
+      browser.player = player;
+      browser.problem = "";
+      browser.waiters.splice(0).forEach((w) => w.resolve(device_id));
+    });
+    player.addListener("not_ready", () => { browser.id = null; });
+    player.addListener("account_error", () => browserProblem("Playing in this browser needs Spotify Premium."));
+    player.addListener("initialization_error", () => browserProblem("This browser can't play Spotify music (protected content is turned off). Turn it on in the browser's settings, or pick another device."));
+    player.addListener("authentication_error", () => browserProblem("This browser couldn't sign in to play music. Sign out and in again, or pick another device."));
+    player.addListener("autoplay_failed", () => setStatus("play-status", "The browser blocked the sound. Press ▶ to start it.", "err"));
+    player.connect().then((ok) => { if (!ok) browserProblem("Spotify's player couldn't start in this browser. Pick another device."); });
+  };
+  const script = document.createElement("script");
+  script.src = "https://sdk.scdn.co/spotify-player.js";
+  script.onerror = () => browserProblem("Couldn't load Spotify's player. Check your connection or pick another device.");
+  document.head.append(script);
+}
+
+// Resolves with the browser player's device id once it's connected.
+function browserReady() {
+  startBrowserPlayer();
+  if (browser.id) return Promise.resolve(browser.id);
+  if (browser.problem) return Promise.reject(Object.assign(new Error(browser.problem), { browser: true }));
+  return new Promise((resolve, reject) => {
+    const w = { resolve, reject };
+    browser.waiters.push(w);
+    setTimeout(() => {
+      const i = browser.waiters.indexOf(w);
+      if (i === -1) return;
+      browser.waiters.splice(i, 1);
+      reject(Object.assign(new Error("This browser's player is still starting. Press ▶ again in a moment."), { browser: true }));
+    }, 12000);
+  });
 }
 
 // --- Bargain bin ---

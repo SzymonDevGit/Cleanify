@@ -17,12 +17,14 @@ Address: https://cleanify.szy.monster/
 - Only playlists you made or collaborate on are listed, because Spotify won't let
   apps change other people's playlists.
 - By default it saves a private "(backup)" copy of a playlist the first time you clean it.
-- ▶ plays the song on your open Spotify app (needs Premium). Autoplay plays each new card.
+- ▶ plays the song on the device picked under **Play on** (remembered): one of your
+  Spotify apps or speakers, or **This browser** (Spotify's Web Playback SDK; not Firefox/Zen).
+  Needs Premium. Autoplay plays each new card.
 - What you've kept, removed and can undo is remembered per playlist in this browser.
 
 ## Spotify app settings
 
-Add these Redirect URIs to your Spotify app and tick **Web API**:
+Add these Redirect URIs to your Spotify app and tick **Web API** and **Web Playback SDK**:
 
 - `https://cleanify.szy.monster/`
 - `http://127.0.0.1:8000/` (to run it on your PC)
