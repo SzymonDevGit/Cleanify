@@ -179,8 +179,23 @@ class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
+// Recent playback calls and what Spotify answered, for the "Copy details" link.
+const debugLog = [];
+function debug(line) {
+  debugLog.push(`${new Date().toISOString().slice(11, 19)} ${line}`);
+  if (debugLog.length > 120) debugLog.shift();
+}
+
+function describePlayer(st) {
+  if (!st) return "nothing playing";
+  return `${st.is_playing ? "playing" : "paused"} "${(st.item || {}).name || "?"}" on ${(st.device || {}).name || "?"}` +
+    `${st.context ? " from " + st.context.uri : ""}${st.shuffle_state ? " (shuffle on)" : ""}`;
+}
+
 async function api(path, { method = "GET", body } = {}, retried = false) {
   const url = path.startsWith("http") ? path : "https://api.spotify.com/v1" + path;
+  const short = url.replace("https://api.spotify.com/v1", "");
+  const logIt = short.startsWith("/me/player");
   const res = await fetch(url, {
     method,
     headers: {
@@ -195,14 +210,26 @@ async function api(path, { method = "GET", body } = {}, retried = false) {
     store.set("cl_token", token);
     return api(path, { method, body }, true);
   }
-  if (res.status === 429) throw new ApiError(429, "Spotify is getting too many requests right now. Wait a minute and try again.");
+  if (res.status === 429) {
+    if (logIt) debug(`${method} ${short} -> 429`);
+    throw new ApiError(429, "Spotify is getting too many requests right now. Wait a minute and try again.");
+  }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new ApiError(res.status, (data.error && data.error.message) || `Spotify request failed (${res.status})`);
+    const message = (data.error && data.error.message) || `Spotify request failed (${res.status})`;
+    if (logIt) debug(`${method} ${short}${body ? " " + JSON.stringify(body) : ""} -> ${res.status} ${message}`);
+    throw new ApiError(res.status, message);
   }
-  if (res.status === 204) return null;
-  const text = await res.text();
-  return text ? JSON.parse(text) : null;
+  const text = res.status === 204 ? "" : await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (logIt) {
+    const said = method !== "GET" ? ""
+      : short.startsWith("/me/player?") || short === "/me/player" ? describePlayer(data)
+      : short.startsWith("/me/player/devices") ? ((data && data.devices) || []).map((d) => `${d.name}${d.is_active ? "*" : ""}${d.is_restricted ? " (restricted)" : ""}`).join(", ")
+      : "";
+    debug(`${method} ${short}${body ? " " + JSON.stringify(body) : ""} -> ${res.status}${said ? " " + said : ""}`);
+  }
+  return data;
 }
 
 // Spotify renamed a playlist's /tracks to /items in 2026, and changed the body keys
@@ -826,16 +853,31 @@ function sameSong(item, t) {
 
 // After a play request, check Spotify really plays the card's song. Some phones ignore
 // the requested start song when shuffle is on, and some apps ignore single-song plays.
+// Phones can take a few seconds to report the new song, so give it up to 6 s.
 async function confirmPlaying(t, seq) {
   for (let i = 0; i < 8; i++) {
-    await sleep(500);
+    await sleep(i < 4 ? 500 : 1000);
     if (seq !== playSeq) return true;
     let st;
     try { st = await api("/me/player?additional_types=track"); } catch { return true; }  // can't tell: trust it
     if (st && st.item && sameSong(st.item, t)) return true;
-    if (st && st.item && i >= 3) return false;
   }
   return false;
+}
+
+// Waking a phone that isn't the active Spotify device: a play request sent straight to
+// it often just resumes its last song for a moment. Move playback there first (paused),
+// wait until Spotify says it's active, then ask for the song.
+async function makeActive(id) {
+  let st = null;
+  try { st = await api("/me/player"); } catch { /* ignore */ }
+  if (st && st.device && st.device.id === id) return;
+  try { await api("/me/player", { method: "PUT", body: { device_ids: [id], play: false } }); } catch { return; }
+  for (let i = 0; i < 10; i++) {
+    await sleep(500);
+    try { st = await api("/me/player"); } catch { return; }
+    if (st && st.device && st.device.id === id) return;
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -957,6 +999,7 @@ async function playOn(device, body) {
     return id;
   }
   try {
+    await makeActive(device.id);
     await put(device.id);
     return device.id;
   } catch (err) {
@@ -1211,6 +1254,25 @@ function restoreExtras(step) {
   });
 }
 
+async function copyDetails() {
+  const device = savedDevice();
+  const text = [
+    `Cleanify details, ${new Date().toISOString()}`,
+    `Browser: ${navigator.userAgent}`,
+    `Play on: ${device ? device.name : "(none)"}; ways that worked: ${JSON.stringify(store.get("cl_play_methods", {}))}`,
+    `Card: ${state.current ? `${state.current.title} (${state.current.uri})` : "(none)"}`,
+    `Permissions: ${(store.get("cl_token") || {}).scope || "(not recorded)"}`,
+    "",
+    ...debugLog,
+  ].join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    setStatus("play-status", "Details copied. Paste them in the chat.", "ok");
+  } catch {
+    window.prompt("Copy this:", text);
+  }
+}
+
 // --- Bargain bin ---
 function showBin() {
   const n = state.mem.removed.length;
@@ -1285,6 +1347,7 @@ function wire() {
   $("bin-btn").addEventListener("click", () => decide("remove"));
   $("keep-btn").addEventListener("click", () => decide("keep"));
   $("play-btn").addEventListener("click", playCurrent);
+  $("copy-details").addEventListener("click", copyDetails);
   $("device-select").addEventListener("change", onPickDevice);
   $("device-refresh").addEventListener("click", loadDevices);
   $("undo-btn").addEventListener("click", undo);
