@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cleanify</title>
+  <meta name="description" content="Clean up your Spotify playlists by swiping. Right keeps a song, left sends it to the bargain bin.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='2' y='8' width='40' height='48' fill='%231f4d6b'/%3E%3Ccircle cx='40' cy='32' r='22' fill='%23111'/%3E%3Ccircle cx='40' cy='32' r='6' fill='%23b8322a'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Abril+Fatface&family=Work+Sans:wght@400;600;700&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="wrap">
+
+    <!-- Sign in -->
+    <section id="screen-login" class="screen hidden">
+      <h1 class="logo big">Cleanify</h1>
+      <p class="sub">Flip through a playlist like a crate of records. Swipe right to keep a song, left to send it to the bargain bin.</p>
+      <div class="crate-art" aria-hidden="true"><div class="sleeve s1"></div><div class="sleeve s2"></div><div class="sleeve s3"><div class="vinyl"></div></div></div>
+      <details id="own-app" class="own-app">
+        <summary id="own-summary">Set up your Spotify app (once per browser)</summary>
+        <p>Cleanify talks to Spotify through a free Spotify app of your own:</p>
+        <ol>
+          <li>Go to <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer.spotify.com/dashboard</a> and press <b>Create app</b>.</li>
+          <li>Give it any name and description. Under <b>Redirect URIs</b>, add <code id="own-redirect"></code> and press Add.</li>
+          <li>Tick <b>Web API</b>, agree to the terms and press <b>Save</b>.</li>
+          <li>Copy the app's <b>Client ID</b>, paste it here and press <b>Save</b>.</li>
+        </ol>
+        <div class="row"><input id="own-id" placeholder="Client ID" autocomplete="off" spellcheck="false" aria-label="Client ID"><button id="own-save" class="btn">Save</button></div>
+        <p id="own-status" class="small warn"></p>
+        <p class="small muted">Friends can sign in to your app too: add their Spotify email under <b>User Management</b> (up to 5 people).</p>
+      </details>
+      <p id="own-using" class="small muted"></p>
+      <button id="login-btn" class="btn primary wide">Sign in with Spotify</button>
+      <p class="small muted">Your sign-in stays in this browser only.</p>
+      <p id="login-status" class="status"></p>
+    </section>
+
+    <!-- Pick a playlist -->
+    <section id="screen-playlists" class="screen hidden">
+      <header class="top">
+        <h1 class="logo">Cleanify</h1>
+        <p class="small muted"><span id="user-name"></span> · <a href="#" id="logout-link">Sign out</a></p>
+      </header>
+      <h2 class="rule">Pick a crate to dig through</h2>
+      <p class="small muted">Spotify only lets you change playlists you made or collaborate on, so only those are listed.</p>
+      <label class="small check"><input type="checkbox" id="backup" checked> Save a private backup copy of a playlist the first time I clean it</label>
+      <ul id="playlist-list" class="plist"></ul>
+      <p id="playlists-status" class="status"></p>
+      <button id="refresh-btn" class="btn ghost">Refresh list</button>
+    </section>
+
+    <!-- Swipe -->
+    <section id="screen-swipe" class="screen hidden">
+      <header class="top">
+        <a href="#" id="back-link" class="logo" title="Back to your playlists">Cleanify</a>
+        <label class="small auto"><input type="checkbox" id="autoplay"> Autoplay</label>
+      </header>
+      <div class="rule pl"><span id="pl-name"></span><span><b id="pos"></b> / <span id="total"></span> songs</span></div>
+      <div class="prog"><i id="prog-bar"></i></div>
+      <div id="deck" class="deck"></div>
+      <div class="actions">
+        <button id="bin-btn" class="round bin" title="Bargain bin (left arrow)" aria-label="Send to the bargain bin">✕</button>
+        <button id="play-btn" class="round play" title="Play on Spotify (space)" aria-label="Play on Spotify">▶</button>
+        <button id="keep-btn" class="round keep" title="Keep (right arrow)" aria-label="Keep in the crate">＋</button>
+      </div>
+      <p id="play-status" class="status small"></p>
+      <div class="tally">
+        <a href="#" id="tally-bin">Bargain bin: <b id="bin-count">0</b></a>
+        <button id="undo-btn" class="linkish">↶ Undo</button>
+        <span>In the crate: <b id="keep-count">0</b></span>
+      </div>
+      <p class="hint">← swipe left to remove · swipe right to keep →<br>Removed songs leave the playlist straight away. Undo puts them back.</p>
+    </section>
+
+    <!-- Bargain bin: songs removed from this playlist, each can be put back -->
+    <section id="screen-bin" class="screen hidden">
+      <header class="top">
+        <a href="#" id="bin-back" class="logo" title="Back to swiping">Cleanify</a>
+      </header>
+      <h2 class="rule">The bargain bin</h2>
+      <p id="bin-intro" class="small"></p>
+      <ul id="bin-list" class="binlist"></ul>
+      <button id="bin-continue" class="btn primary wide">Keep swiping</button>
+      <p id="bin-status" class="status"></p>
+    </section>
+
+    <!-- Finished a playlist -->
+    <section id="screen-done" class="screen hidden">
+      <h1 class="logo big">All sorted!</h1>
+      <p id="done-text" class="sub"></p>
+      <button id="done-bin" class="btn wide">See the bargain bin</button>
+      <button id="again-btn" class="btn primary wide">Clean another playlist</button>
+      <button id="restart-btn" class="btn ghost wide">Go through this playlist again</button>
+    </section>
+
+  </main>
+  <footer class="foot">
+    <a href="https://szy.monster/">More from szy.monster</a> · <a href="https://discord.gg/bHxaXgjpfe" target="_blank" rel="noopener">Bugs &amp; ideas on Discord</a> · <a href="https://cheltenhamdata.co.uk/">Cheltenham Data</a>
+  </footer>
+  <script src="app.js"></script>
+</body>
+</html>

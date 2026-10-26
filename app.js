@@ -1,0 +1,856 @@
+/*
+ * Cleanify: clean up a Spotify playlist by swiping through it like a crate of records.
+ * Swipe right (or →) keeps a song, swipe left (or ←) removes it from the playlist
+ * straight away. Undo puts removed songs back where they were.
+ *
+ * Runs fully in the browser. Spotify sign-in uses the PKCE flow, so no client
+ * secret is needed (or allowed) here.
+ */
+"use strict";
+
+// Everyone uses their own Spotify app (Spotify lets only 5 people sign in to an app in
+// development mode). Its Client ID is entered on the sign-in screen and kept in this
+// browser. Never put a client secret in this file.
+const CLIENT_ID = (() => {
+  try { return JSON.parse(localStorage.getItem("cl_client_id")) || ""; } catch { return ""; }
+})();
+const SCOPES = [
+  "playlist-read-private",
+  "playlist-read-collaborative",
+  "playlist-modify-private",
+  "playlist-modify-public",
+  "user-read-playback-state",
+  "user-modify-playback-state",
+].join(" ");
+// Must match a Redirect URI in the Spotify dashboard exactly.
+const REDIRECT_URI = location.origin + location.pathname.replace(/index\.html$/, "");
+const SWIPE_DISTANCE = 100;   // px a card must be dragged to count as a swipe
+const HISTORY_SIZE = 100;     // undo steps kept per playlist
+
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------------
+// Storage (wrapped: private windows can throw)
+// ---------------------------------------------------------------------
+const store = {
+  get(key, fallback = null) {
+    try {
+      const v = localStorage.getItem(key);
+      return v === null ? fallback : JSON.parse(v);
+    } catch { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
+  },
+  remove(key) {
+    try { localStorage.removeItem(key); } catch { /* ignore */ }
+  },
+};
+
+// ---------------------------------------------------------------------
+// Spotify auth (Authorization Code with PKCE)
+// ---------------------------------------------------------------------
+function randomString(len) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
+  return Array.from(bytes, (b) => chars[b % chars.length]).join("");
+}
+
+async function codeChallenge(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function startLogin() {
+  if (!CLIENT_ID) return;
+  const verifier = randomString(64);
+  const state = randomString(16);
+  store.set("cl_verifier", verifier);
+  store.set("cl_state", state);
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID,
+    response_type: "code",
+    redirect_uri: REDIRECT_URI,
+    code_challenge_method: "S256",
+    code_challenge: await codeChallenge(verifier),
+    scope: SCOPES,
+    state,
+  });
+  location.href = "https://accounts.spotify.com/authorize?" + params;
+}
+
+function saveToken(data) {
+  const token = {
+    access: data.access_token,
+    refresh: data.refresh_token || (store.get("cl_token") || {}).refresh,
+    expires: Date.now() + (data.expires_in - 60) * 1000,
+  };
+  store.set("cl_token", token);
+  return token;
+}
+
+async function tokenRequest(body) {
+  const res = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: CLIENT_ID, ...body }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error_description || data.error || `Spotify sign-in failed (${res.status})`);
+  return saveToken(data);
+}
+
+async function handleRedirect() {
+  const params = new URLSearchParams(location.search);
+  if (!params.has("code") && !params.has("error")) return;
+  history.replaceState(null, "", REDIRECT_URI);
+  if (params.get("error")) throw new Error(`Spotify sign-in was cancelled (${params.get("error")}).`);
+  if (params.get("state") !== store.get("cl_state")) throw new Error("Sign-in check failed. Please try again.");
+  await tokenRequest({
+    grant_type: "authorization_code",
+    code: params.get("code"),
+    redirect_uri: REDIRECT_URI,
+    code_verifier: store.get("cl_verifier"),
+  });
+  store.remove("cl_verifier");
+  store.remove("cl_state");
+}
+
+// Requests that find the token expired at once share one refresh, because Spotify
+// may replace the refresh token and a second refresh with the old one would fail.
+let refreshing = null;
+async function accessToken() {
+  let token = store.get("cl_token");
+  if (!token) throw new Error("Not signed in.");
+  if (Date.now() > token.expires) {
+    if (!token.refresh) throw new Error("Not signed in.");
+    refreshing = refreshing || tokenRequest({ grant_type: "refresh_token", refresh_token: token.refresh })
+      .finally(() => { refreshing = null; });
+    token = await refreshing;
+  }
+  return token.access;
+}
+
+function logout() {
+  store.remove("cl_token");
+  location.reload();
+}
+
+// Switches to another Spotify app. A sign-in belongs to one app, so it signs you out too.
+function setClientId(id) {
+  store.set("cl_client_id", id);
+  store.remove("cl_token");
+  location.reload();
+}
+
+// Until a Client ID is saved the setup steps are open and Sign in is disabled;
+// afterwards they fold away behind "Use a different Spotify app".
+function renderOwnApp() {
+  $("own-redirect").textContent = REDIRECT_URI;
+  $("login-btn").disabled = !CLIENT_ID;
+  if (!CLIENT_ID) {
+    $("own-app").open = true;
+    return;
+  }
+  $("own-summary").textContent = "Use a different Spotify app";
+  $("own-id").value = CLIENT_ID;
+  $("own-using").textContent = `Using your Spotify app (…${CLIENT_ID.slice(-4)}).`;
+}
+
+function onOwnAppSave() {
+  const id = $("own-id").value.trim();
+  if (!/^[0-9a-f]{32}$/i.test(id)) {
+    $("own-status").textContent = "That doesn't look like a Client ID. It's 32 letters and numbers, shown on your app's page in the Spotify dashboard.";
+    return;
+  }
+  setClientId(id.toLowerCase());
+}
+
+// ---------------------------------------------------------------------
+// Spotify Web API
+// ---------------------------------------------------------------------
+class ApiError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+async function api(path, { method = "GET", body } = {}, retried = false) {
+  const url = path.startsWith("http") ? path : "https://api.spotify.com/v1" + path;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: "Bearer " + await accessToken(),
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401 && !retried) {
+    const token = store.get("cl_token") || {};
+    token.expires = 0;
+    store.set("cl_token", token);
+    return api(path, { method, body }, true);
+  }
+  if (res.status === 429) throw new ApiError(429, "Spotify is getting too many requests right now. Wait a minute and try again.");
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new ApiError(res.status, (data.error && data.error.message) || `Spotify request failed (${res.status})`);
+  }
+  if (res.status === 204) return null;
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+// Spotify renamed a playlist's /tracks to /items in 2026, and changed the body keys
+// with it. Try the forms in turn and remember the one that worked.
+async function playlistItemsCall(playlistId, method, forms) {
+  const key = "cl_form_" + method;
+  const first = store.get(key, 0);
+  const order = [first, ...forms.keys()].filter((v, i, a) => a.indexOf(v) === i && v < forms.length);
+  let lastErr;
+  for (const i of order) {
+    const [path, body] = forms[i];
+    try {
+      const res = await api(`/playlists/${encodeURIComponent(playlistId)}/${path}`, { method, body });
+      store.set(key, i);
+      return res;
+    } catch (err) {
+      if (![400, 404, 405].includes(err.status)) throw err;
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+function removeFromPlaylist(playlistId, uris) {
+  const list = uris.map((uri) => ({ uri }));
+  return playlistItemsCall(playlistId, "DELETE", [
+    ["items", { items: list }],
+    ["items", { tracks: list }],
+    ["tracks", { tracks: list }],
+  ]);
+}
+
+function addToPlaylist(playlistId, uris, position) {
+  const body = position === undefined ? { uris } : { uris, position };
+  return playlistItemsCall(playlistId, "POST", [["items", body], ["tracks", body]]);
+}
+
+async function createPlaylist(me, name, description) {
+  const body = { name, description, public: false };
+  try {
+    return await api("/me/playlists", { method: "POST", body });
+  } catch (err) {
+    if (![404, 405].includes(err.status)) throw err;
+    return api(`/users/${encodeURIComponent(me.id)}/playlists`, { method: "POST", body });
+  }
+}
+
+async function firstItemsPage(id) {
+  const qs = "?limit=50&market=from_token";
+  try {
+    return await api(`/playlists/${encodeURIComponent(id)}/items${qs}`);
+  } catch (err) {
+    if (err.status !== 404) throw err;
+    return api(`/playlists/${encodeURIComponent(id)}/tracks${qs}`);
+  }
+}
+
+function pickImage(images, small) {
+  const list = (images || []).filter((i) => i && i.url);
+  if (!list.length) return "";
+  return (small ? list[list.length - 1] : list[0]).url;
+}
+
+// Playlists you can change: ones you made or collaborate on.
+async function fetchPlaylists(me) {
+  const list = [];
+  let page = await api("/me/playlists?limit=50");
+  for (let n = 0; page && n < 20; n++) {
+    list.push(...(page.items || []).filter(Boolean));
+    page = page.next ? await api(page.next) : null;
+  }
+  return list
+    .filter((p) => (p.owner && p.owner.id === me.id) || p.collaborative)
+    .map((p) => ({
+      id: p.id,
+      uri: p.uri,
+      name: p.name || "Untitled playlist",
+      total: ((p.items || p.tracks) || {}).total,
+      image: pickImage(p.images, true),
+    }));
+}
+
+// Every entry in playlist order (kept so songs can be put back in the right place),
+// plus one card per different song.
+async function fetchPlaylistSongs(id) {
+  const entries = [];
+  const tracks = [];
+  const seen = new Set();
+  let page;
+  try {
+    page = await firstItemsPage(id);
+  } catch (err) {
+    if (err.status === 403) throw new Error("Spotify won't let this app read that playlist.");
+    if (err.status === 404) throw new Error("Spotify couldn't find that playlist.");
+    throw err;
+  }
+  while (page) {
+    for (const entry of page.items || []) {
+      const t = entry.track || entry.item;
+      const uri = t && !t.is_local && t.uri ? t.uri : null;
+      entries.push({ uri, gone: false });
+      if (!uri || seen.has(uri)) continue;
+      seen.add(uri);
+      const album = t.album || t.show || {};
+      tracks.push({
+        uri,
+        title: t.name || "Unknown title",
+        artists: (t.artists || []).map((a) => a.name).join(", ") || (t.show ? t.show.publisher || "" : "") || "Unknown artist",
+        year: ((album.release_date || t.release_date || "").match(/^\d{4}/) || [""])[0],
+        cover: pickImage(album.images || t.images),
+        thumb: pickImage(album.images || t.images, true),
+        added: entry.added_at || "",
+        duration: t.duration_ms || 0,
+        entry: entries.length - 1,
+      });
+    }
+    page = page.next ? await api(page.next) : null;
+  }
+  return { entries, tracks };
+}
+
+// ---------------------------------------------------------------------
+// Per-playlist memory: kept songs, the bargain bin and undo steps
+// ---------------------------------------------------------------------
+function loadMemory(id) {
+  const m = store.get("cl_pl_" + id, {}) || {};
+  return {
+    kept: m.kept || [],
+    removed: m.removed || [],    // {uri, title, artists, year, cover, thumb, added, duration, pos}
+    history: m.history || [],    // {uri, dec: "keep" | "remove"}
+    backup: m.backup || null,
+  };
+}
+
+function saveMemory() {
+  const { id } = state.playlist;
+  state.mem.history = state.mem.history.slice(-HISTORY_SIZE);
+  store.set("cl_pl_" + id, state.mem);
+}
+
+// ---------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------
+const state = {
+  me: null,
+  playlists: [],
+  playlist: null,  // {id, uri, name}
+  entries: [],     // every playlist entry in order: {uri, gone}
+  tracks: [],      // one per song: see fetchPlaylistSongs
+  mem: null,
+  current: null,   // the track on top of the deck
+  busy: false,     // a backup is being made
+};
+
+// Spotify calls that change the playlist run one at a time, in swipe order.
+let queue = Promise.resolve();
+function enqueue(job) {
+  const run = queue.then(job);
+  queue = run.catch(() => {});
+  return run;
+}
+
+function isKept(t) { return state.mem.kept.includes(t.uri); }
+function isGone(t) { return state.entries[t.entry] && state.entries[t.entry].gone; }
+function undecided() { return state.tracks.filter((t) => !isKept(t) && !isGone(t)); }
+
+// Where the song sits in the playlist now: the entries before it that are still there.
+function currentPosition(t) {
+  let n = 0;
+  for (let i = 0; i < t.entry; i++) if (!state.entries[i].gone) n++;
+  return n;
+}
+
+// Removing a song takes out every copy of it (putting back adds one).
+function setGone(uri, gone) {
+  state.entries.forEach((e) => { if (e.uri === uri) e.gone = gone; });
+}
+
+function trackByUri(uri) { return state.tracks.find((t) => t.uri === uri); }
+
+// A removed song from an earlier visit isn't in the list we loaded: slot it back in
+// at the position it had when it was removed.
+function restoreTrack(saved) {
+  let t = trackByUri(saved.uri);
+  if (t) return t;
+  const target = Math.max(0, saved.pos || 0);
+  let e = 0, present = 0;
+  while (e < state.entries.length && (state.entries[e].gone || present < target)) {
+    if (!state.entries[e].gone) present++;
+    e++;
+  }
+  state.entries.splice(e, 0, { uri: saved.uri, gone: true });
+  state.tracks.forEach((x) => { if (x.entry >= e) x.entry++; });
+  t = { ...saved, entry: e };
+  delete t.pos;
+  const at = state.tracks.findIndex((x) => x.entry > e);
+  state.tracks.splice(at === -1 ? state.tracks.length : at, 0, t);
+  return t;
+}
+
+// ---------------------------------------------------------------------
+// Screens
+// ---------------------------------------------------------------------
+function showScreen(name) {
+  document.querySelectorAll(".screen").forEach((s) => s.classList.add("hidden"));
+  $("screen-" + name).classList.remove("hidden");
+  window.scrollTo(0, 0);
+}
+
+function setStatus(id, text, kind = "") {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "status" + (kind ? " " + kind : "") + (el.classList.contains("small") ? " small" : "");
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function thumbEl(url) {
+  const t = el("span", "thumb");
+  if (url) t.style.backgroundImage = `url("${url.replace(/"/g, "%22")}")`;
+  return t;
+}
+
+function ago(iso) {
+  const ms = Date.now() - Date.parse(iso);
+  if (!iso || !(ms >= 0)) return "";
+  const days = Math.floor(ms / 86400000);
+  if (days < 1) return "Added today";
+  if (days < 31) return `Added ${days} day${days === 1 ? "" : "s"} ago`;
+  const months = Math.floor(days / 30.4);
+  if (months < 12) return `Added ${months} month${months === 1 ? "" : "s"} ago`;
+  const years = Math.floor(days / 365.25);
+  return `Added ${years} yr${years === 1 ? "" : "s"} ago`;
+}
+
+function duration(ms) {
+  if (!ms) return "";
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// --- Playlists ---
+async function showPlaylists() {
+  showScreen("playlists");
+  stopAutoplay();
+  setStatus("playlists-status", "Loading your playlists…");
+  try {
+    state.playlists = await fetchPlaylists(state.me);
+    renderPlaylists();
+    setStatus("playlists-status", state.playlists.length ? "" : "You have no playlists of your own yet.");
+  } catch (err) {
+    setStatus("playlists-status", err.message, "err");
+  }
+}
+
+function renderPlaylists() {
+  const ul = $("playlist-list");
+  ul.textContent = "";
+  for (const p of state.playlists) {
+    const li = el("li");
+    const b = el("button");
+    b.append(thumbEl(p.image));
+    const text = el("span");
+    text.append(el("span", "name", p.name), el("span", "meta", p.total === undefined ? "" : `${p.total} songs`));
+    b.append(text);
+    const mem = loadMemory(p.id);
+    const sorted = mem.kept.length + mem.removed.length;
+    if (sorted) b.append(el("span", "badge", `${sorted} sorted`));
+    b.addEventListener("click", () => openPlaylist(p));
+    li.append(b);
+    ul.append(li);
+  }
+}
+
+async function openPlaylist(p) {
+  setStatus("playlists-status", `Opening ${p.name}…`);
+  try {
+    const { entries, tracks } = await fetchPlaylistSongs(p.id);
+    state.playlist = p;
+    state.entries = entries;
+    state.tracks = tracks;
+    state.mem = loadMemory(p.id);
+    // Songs kept earlier but since taken out of the playlist elsewhere don't count any more.
+    state.mem.kept = state.mem.kept.filter((u) => trackByUri(u));
+    setStatus("playlists-status", "");
+    setStatus("play-status", "");
+    $("pl-name").textContent = p.name;
+    showScreen("swipe");
+    render();
+    if ($("backup").checked && !state.mem.backup && tracks.length) await makeBackup();
+  } catch (err) {
+    setStatus("playlists-status", err.message, "err");
+  }
+}
+
+async function makeBackup() {
+  state.busy = true;
+  render();
+  setStatus("play-status", "Saving a backup copy first…");
+  try {
+    const p = state.playlist;
+    const date = new Date().toISOString().slice(0, 10);
+    const copy = await createPlaylist(state.me, `${p.name} (backup)`, `Copy of ${p.name} saved by Cleanify on ${date}, before cleaning.`);
+    const uris = state.entries.map((e) => e.uri).filter(Boolean);
+    for (let i = 0; i < uris.length; i += 100) await addToPlaylist(copy.id, uris.slice(i, i + 100));
+    state.mem.backup = copy.id;
+    saveMemory();
+    setStatus("play-status", `Backup saved as "${p.name} (backup)" in your library.`, "ok");
+  } catch (err) {
+    setStatus("play-status", `Couldn't save a backup (${err.message}). You can still swipe, or go back and try again.`, "err");
+  } finally {
+    state.busy = false;
+    render();
+  }
+}
+
+// --- Swipe deck ---
+function cardEl(t, cls) {
+  const c = el("div", "card " + cls);
+  if (!t) return c;
+  const art = el("div", "sleeve-art");
+  art.append(el("div", "vinyl"));
+  if (t.cover) {
+    const img = el("img", "cover");
+    img.src = t.cover;
+    img.alt = "";
+    img.draggable = false;
+    art.append(img);
+  } else {
+    art.append(el("div", "fallback", t.title));
+  }
+  if (t.year) art.append(el("div", "sticker", t.year));
+  c.append(art, el("h2", "", t.title), el("p", "artist", t.artists));
+  const meta = el("div", "meta");
+  for (const m of [ago(t.added), duration(t.duration)]) if (m) meta.append(el("span", "", m));
+  c.append(meta);
+  if (cls === "top") {
+    c.append(el("div", "stamp keep", "KEEP"), el("div", "stamp bin", "REMOVE"));
+    dragHandlers(c);
+  }
+  return c;
+}
+
+function render() {
+  const left = undecided();
+  const total = state.tracks.length;
+  const done = total - left.length;
+  const prev = state.current;
+  state.current = left[0] || null;
+
+  $("pos").textContent = Math.min(done + 1, total);
+  $("total").textContent = total;
+  $("prog-bar").style.width = total ? `${(done / total) * 100}%` : "0";
+  $("bin-count").textContent = state.mem.removed.length;
+  $("keep-count").textContent = state.mem.kept.length;
+  $("undo-btn").disabled = !state.mem.history.length || state.busy;
+  for (const id of ["bin-btn", "keep-btn", "play-btn"]) $(id).disabled = !state.current || state.busy;
+
+  const deck = $("deck");
+  deck.textContent = "";
+  if (!state.current) {
+    if (!state.busy) return showDone();
+    return;
+  }
+  deck.append(cardEl(left[2], "b2"), cardEl(left[1], "b1"), cardEl(state.current, "top"));
+  if (!left[2]) deck.firstChild.remove();
+  if (!left[1]) deck.querySelector(".b1").remove();
+  if (prev !== state.current && autoplay() && !state.busy) playCurrent();
+}
+
+function decide(dec, fromDrag) {
+  const t = state.current;
+  if (!t || state.busy) return;
+  const card = $("deck").querySelector(".card.top");
+  if (card) {
+    const dir = dec === "keep" ? 1 : -1;
+    if (!fromDrag) card.querySelector(dec === "keep" ? ".stamp.keep" : ".stamp.bin").style.opacity = 1;
+    card.classList.add("fly");
+    card.style.transform = `translate(${dir * 600}px, 40px) rotate(${dir * 30}deg)`;
+  }
+  setStatus("play-status", "");
+  state.mem.history.push({ uri: t.uri, dec });
+  if (dec === "keep") {
+    state.mem.kept.push(t.uri);
+  } else {
+    const pos = currentPosition(t);
+    setGone(t.uri, true);
+    const { entry, ...saved } = t;
+    state.mem.removed.push({ ...saved, pos });
+    enqueue(() => removeFromPlaylist(state.playlist.id, [t.uri])).catch((err) => {
+      // It's still in the playlist: undo the swipe so the screen matches Spotify.
+      setGone(t.uri, false);
+      state.mem.removed = state.mem.removed.filter((r) => r.uri !== t.uri);
+      state.mem.history = state.mem.history.filter((h) => !(h.uri === t.uri && h.dec === "remove"));
+      saveMemory();
+      render();
+      showScreen("swipe");
+      setStatus("play-status", `Couldn't remove "${t.title}": ${removeError(err)}`, "err");
+    });
+  }
+  saveMemory();
+  setTimeout(render, card ? 220 : 0);
+}
+
+function removeError(err) {
+  if (err.status === 403) return "Spotify says you can't change this playlist.";
+  return err.message;
+}
+
+// Puts a removed song back where it was. Used by Undo and the bargain bin.
+function putBack(uri) {
+  const saved = state.mem.removed.find((r) => r.uri === uri);
+  if (!saved) return Promise.resolve(null);
+  const t = restoreTrack(saved);
+  return enqueue(async () => {
+    const pos = currentPosition(t);
+    await addToPlaylist(state.playlist.id, [uri], pos);
+    state.entries[t.entry].gone = false;
+    state.mem.removed = state.mem.removed.filter((r) => r.uri !== uri);
+    saveMemory();
+    return t;
+  });
+}
+
+async function undo() {
+  const last = state.mem.history.pop();
+  if (!last) return;
+  saveMemory();
+  $("undo-btn").disabled = true;
+  if (last.dec === "keep") {
+    state.mem.kept = state.mem.kept.filter((u) => u !== last.uri);
+    saveMemory();
+    render();
+    return;
+  }
+  setStatus("play-status", "Putting it back…");
+  try {
+    const t = await putBack(last.uri);
+    setStatus("play-status", t ? `"${t.title}" is back in the playlist.` : "", "ok");
+  } catch (err) {
+    state.mem.history.push(last);
+    saveMemory();
+    setStatus("play-status", `Couldn't put it back: ${err.message}`, "err");
+  }
+  render();
+}
+
+// Drag the top card left or right; let go past SWIPE_DISTANCE to decide.
+function dragHandlers(card) {
+  let startX = 0, startY = 0, dx = 0, dragging = false;
+  const keep = card.querySelector(".stamp.keep");
+  const bin = card.querySelector(".stamp.bin");
+  card.addEventListener("pointerdown", (e) => {
+    if (state.busy) return;
+    dragging = true;
+    startX = e.clientX;
+    startY = e.clientY;
+    dx = 0;
+    card.setPointerCapture(e.pointerId);
+    card.classList.add("drag");
+    card.classList.remove("snap");
+  });
+  card.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    dx = e.clientX - startX;
+    const dy = (e.clientY - startY) * 0.3;
+    card.style.transform = `translate(${dx}px, ${dy}px) rotate(${dx / 18}deg)`;
+    keep.style.opacity = Math.max(0, Math.min(1, dx / SWIPE_DISTANCE));
+    bin.style.opacity = Math.max(0, Math.min(1, -dx / SWIPE_DISTANCE));
+  });
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    card.classList.remove("drag");
+    if (Math.abs(dx) >= SWIPE_DISTANCE) return decide(dx > 0 ? "keep" : "remove", true);
+    card.classList.add("snap");
+    card.style.transform = "";
+    keep.style.opacity = bin.style.opacity = 0;
+  };
+  card.addEventListener("pointerup", end);
+  card.addEventListener("pointercancel", end);
+}
+
+// --- Playing songs on the person's Spotify ---
+function autoplay() { return $("autoplay").checked; }
+function stopAutoplay() { $("play-btn").classList.remove("on"); }
+
+async function playCurrent() {
+  const t = state.current;
+  if (!t) return;
+  const start = Math.min(30000, Math.floor((t.duration || 0) / 3));
+  const fromPlaylist = { context_uri: state.playlist.uri, offset: { uri: t.uri }, position_ms: start };
+  const single = { uris: [t.uri], position_ms: start };
+  setStatus("play-status", "Playing…");
+  try {
+    try {
+      await playOn(fromPlaylist);
+    } catch (err) {
+      if (err.status !== 400) throw err;
+      await playOn(single);
+    }
+    $("play-btn").classList.add("on");
+    if (state.current === t) setStatus("play-status", "");
+  } catch (err) {
+    stopAutoplay();
+    setStatus("play-status", playError(err), "err");
+  }
+}
+
+// Plays on the active Spotify device, or the first one Spotify knows about.
+async function playOn(body) {
+  try {
+    await api("/me/player/play", { method: "PUT", body });
+  } catch (err) {
+    if (err.status !== 404) throw err;
+    const { devices = [] } = (await api("/me/player/devices")) || {};
+    if (!devices.length) throw new ApiError(404, "no device");
+    await api(`/me/player/play?device_id=${encodeURIComponent(devices[0].id)}`, { method: "PUT", body });
+  }
+}
+
+function playError(err) {
+  if (err.status === 404) return "Open Spotify on your phone or computer first, then press ▶ again.";
+  if (err.status === 403) return "Playing songs from here needs Spotify Premium. You can still swipe.";
+  return `Couldn't play it: ${err.message}`;
+}
+
+// --- Bargain bin ---
+function showBin() {
+  const n = state.mem.removed.length;
+  $("bin-intro").textContent = n
+    ? `${n} song${n === 1 ? "" : "s"} removed from ${state.playlist.name}. Changed your mind? Put it back and it returns to where it was.`
+    : `Nothing removed from ${state.playlist.name} yet.`;
+  const ul = $("bin-list");
+  ul.textContent = "";
+  for (const r of [...state.mem.removed].reverse()) {
+    const li = el("li");
+    const text = el("div", "t");
+    text.append(el("b", "", r.title), el("span", "", r.artists + (r.year ? ` · ${r.year}` : "")));
+    const b = el("button", "btn", "Put back");
+    b.addEventListener("click", async () => {
+      b.disabled = true;
+      setStatus("bin-status", "Putting it back…");
+      try {
+        await putBack(r.uri);
+        if (!state.mem.kept.includes(r.uri)) state.mem.kept.push(r.uri);
+        state.mem.history = state.mem.history.filter((h) => h.uri !== r.uri);
+        saveMemory();
+        setStatus("bin-status", `"${r.title}" is back in the playlist.`, "ok");
+        showBin();
+      } catch (err) {
+        b.disabled = false;
+        setStatus("bin-status", `Couldn't put it back: ${err.message}`, "err");
+      }
+    });
+    li.append(thumbEl(r.thumb), text, b);
+    ul.append(li);
+  }
+  $("bin-continue").textContent = undecided().length ? "Keep swiping" : "Done";
+  showScreen("bin");
+}
+
+function leaveBin() {
+  setStatus("bin-status", "");
+  if (undecided().length) {
+    showScreen("swipe");
+    render();
+  } else {
+    showDone();
+  }
+}
+
+function showDone() {
+  const kept = state.mem.kept.length;
+  const removed = state.mem.removed.length;
+  const now = state.entries.filter((e) => !e.gone).length;
+  $("done-text").textContent = `You kept ${kept} and removed ${removed} song${removed === 1 ? "" : "s"}. ${state.playlist.name} now has ${now} song${now === 1 ? "" : "s"}.`;
+  showScreen("done");
+}
+
+function restartPlaylist() {
+  state.mem.kept = [];
+  state.mem.history = state.mem.history.filter((h) => h.dec === "remove");
+  saveMemory();
+  showScreen("swipe");
+  render();
+}
+
+// ---------------------------------------------------------------------
+// Start-up
+// ---------------------------------------------------------------------
+function wire() {
+  $("login-btn").addEventListener("click", startLogin);
+  $("own-save").addEventListener("click", onOwnAppSave);
+  $("own-id").addEventListener("keydown", (e) => { if (e.key === "Enter") onOwnAppSave(); });
+  $("logout-link").addEventListener("click", (e) => { e.preventDefault(); logout(); });
+  $("refresh-btn").addEventListener("click", showPlaylists);
+  $("back-link").addEventListener("click", (e) => { e.preventDefault(); showPlaylists(); });
+  $("bin-btn").addEventListener("click", () => decide("remove"));
+  $("keep-btn").addEventListener("click", () => decide("keep"));
+  $("play-btn").addEventListener("click", playCurrent);
+  $("undo-btn").addEventListener("click", undo);
+  $("tally-bin").addEventListener("click", (e) => { e.preventDefault(); showBin(); });
+  $("bin-back").addEventListener("click", (e) => { e.preventDefault(); leaveBin(); });
+  $("bin-continue").addEventListener("click", leaveBin);
+  $("done-bin").addEventListener("click", showBin);
+  $("again-btn").addEventListener("click", showPlaylists);
+  $("restart-btn").addEventListener("click", restartPlaylist);
+
+  $("autoplay").checked = store.get("cl_autoplay", false);
+  $("autoplay").addEventListener("change", () => {
+    store.set("cl_autoplay", autoplay());
+    if (autoplay()) playCurrent();
+  });
+  $("backup").checked = store.get("cl_backup", true);
+  $("backup").addEventListener("change", () => store.set("cl_backup", $("backup").checked));
+
+  document.addEventListener("keydown", (e) => {
+    if ($("screen-swipe").classList.contains("hidden") || e.target.closest("input")) return;
+    if (e.key === " " && e.target.closest("button")) return;  // the button handles it
+    if (e.key === "ArrowRight") decide("keep");
+    else if (e.key === "ArrowLeft") decide("remove");
+    else if (e.key === " ") { e.preventDefault(); playCurrent(); }
+    else if (e.key === "Backspace" || (e.key === "z" && (e.ctrlKey || e.metaKey))) undo();
+  });
+}
+
+async function main() {
+  wire();
+  renderOwnApp();
+  try {
+    await handleRedirect();
+  } catch (err) {
+    showScreen("login");
+    setStatus("login-status", err.message, "err");
+    return;
+  }
+  if (!CLIENT_ID || !store.get("cl_token")) return showScreen("login");
+  try {
+    state.me = await api("/me");
+    $("user-name").textContent = state.me.display_name || state.me.id;
+    await showPlaylists();
+  } catch (err) {
+    showScreen("login");
+    setStatus("login-status", err.status === 403
+      ? "Spotify didn't let you in. If this isn't your Spotify app, ask its owner to add your email under User Management."
+      : err.message, "err");
+  }
+}
+
+main();
