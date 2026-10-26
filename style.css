@@ -70,6 +70,10 @@ input[type=checkbox] { accent-color: var(--green); }
 
 /* Swipe screen */
 .auto { display: flex; align-items: center; gap: 6px; font-weight: 600; cursor: pointer; }
+.device { display: flex; align-items: center; gap: 8px; }
+.device label { font-weight: 700; text-transform: uppercase; letter-spacing: 1px; font-size: 11px; flex: none; }
+.device select { flex: 1; min-width: 0; font: inherit; font-size: 14px; padding: 6px 8px; border: 2px solid var(--ink); border-radius: 4px; background: var(--card); color: var(--ink); }
+.btn.mini { padding: 5px 10px; }
 .prog { height: 6px; background: #e1d6c4; }
 .prog i { display: block; height: 100%; width: 0; background: var(--ink); transition: width .2s; }
 .deck { position: relative; width: var(--card-w); height: calc(var(--card-w) + 128px); margin: 14px auto 6px; }
@@ -78,6 +82,7 @@ input[type=checkbox] { accent-color: var(--green); }
 .card.b1 { transform: translateY(7px) scale(.96); }
 .card.top { background: var(--card); box-shadow: 0 14px 30px #241a1433; touch-action: none; cursor: grab; z-index: 2; }
 .card.top.drag { cursor: grabbing; transition: none; }
+.card.flying { pointer-events: none; z-index: 5; }
 .card.fly { transition: transform .3s ease-in, opacity .3s; opacity: 0; }
 .card.snap { transition: transform .2s; }
 .sleeve-art { position: relative; width: 100%; aspect-ratio: 1; background: var(--blue); overflow: hidden; flex: none; }

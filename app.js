@@ -492,6 +492,7 @@ async function openPlaylist(p) {
     $("pl-name").textContent = p.name;
     showScreen("swipe");
     render();
+    loadDevices();
     if ($("backup").checked && !state.mem.backup && tracks.length) await makeBackup();
   } catch (err) {
     setStatus("playlists-status", err.message, "err");
@@ -562,15 +563,26 @@ function render() {
   for (const id of ["bin-btn", "keep-btn", "play-btn"]) $(id).disabled = !state.current || state.busy;
 
   const deck = $("deck");
-  deck.textContent = "";
+  deck.querySelectorAll(".card:not(.flying)").forEach((c) => c.remove());
   if (!state.current) {
-    if (!state.busy) return showDone();
+    if (!state.busy) setTimeout(() => { if (!state.current) showDone(); }, 300);
     return;
   }
-  deck.append(cardEl(left[2], "b2"), cardEl(left[1], "b1"), cardEl(state.current, "top"));
-  if (!left[2]) deck.firstChild.remove();
-  if (!left[1]) deck.querySelector(".b1").remove();
-  if (prev !== state.current && autoplay() && !state.busy) playCurrent();
+  const cards = [cardEl(left[2], "b2"), cardEl(left[1], "b1"), cardEl(state.current, "top")]
+    .filter((c, i) => i === 2 || left[2 - i]);
+  deck.prepend(...cards);
+  preloadCovers(left.slice(3, 6));
+  if (prev !== state.current && autoplay() && !state.busy) schedulePlay();
+}
+
+// Fetch the next few covers early so cards don't appear blank.
+const preloaded = new Set();
+function preloadCovers(tracks) {
+  for (const t of tracks) {
+    if (!t.cover || preloaded.has(t.cover)) continue;
+    preloaded.add(t.cover);
+    new Image().src = t.cover;
+  }
 }
 
 function decide(dec, fromDrag) {
@@ -578,10 +590,15 @@ function decide(dec, fromDrag) {
   if (!t || state.busy) return;
   const card = $("deck").querySelector(".card.top");
   if (card) {
+    // The card flies off on its own while the next one is already there to swipe.
     const dir = dec === "keep" ? 1 : -1;
     if (!fromDrag) card.querySelector(dec === "keep" ? ".stamp.keep" : ".stamp.bin").style.opacity = 1;
+    card.classList.remove("top", "drag", "snap");
+    card.classList.add("flying");
+    card.getBoundingClientRect();
     card.classList.add("fly");
     card.style.transform = `translate(${dir * 600}px, 40px) rotate(${dir * 30}deg)`;
+    setTimeout(() => card.remove(), 320);
   }
   setStatus("play-status", "");
   state.mem.history.push({ uri: t.uri, dec });
@@ -604,7 +621,7 @@ function decide(dec, fromDrag) {
     });
   }
   saveMemory();
-  setTimeout(render, card ? 220 : 0);
+  render();
 }
 
 function removeError(err) {
@@ -687,45 +704,119 @@ function dragHandlers(card) {
 }
 
 // --- Playing songs on the person's Spotify ---
+// Songs play on the device picked under "Play on" (remembered in this browser), so
+// Spotify can't wander off to another speaker, like an Echo, between songs.
 function autoplay() { return $("autoplay").checked; }
 function stopAutoplay() { $("play-btn").classList.remove("on"); }
 
+let devices = [];
+function savedDevice() { return store.get("cl_device", null); }  // {id, name}
+
+async function loadDevices() {
+  const select = $("device-select");
+  try {
+    devices = ((await api("/me/player/devices")) || {}).devices || [];
+  } catch (err) {
+    setStatus("play-status", `Couldn't list your Spotify devices: ${err.message}`, "err");
+    devices = [];
+  }
+  const saved = savedDevice();
+  // Device ids can change when an app restarts; the name is a good second guess.
+  const match = saved && (devices.find((d) => d.id === saved.id) || devices.find((d) => d.name === saved.name));
+  if (match && match.id !== saved.id) store.set("cl_device", { id: match.id, name: match.name });
+  select.textContent = "";
+  const first = el("option", "", devices.length ? "Pick a speaker…" : "No Spotify devices found");
+  first.value = "";
+  select.append(first);
+  for (const d of devices) {
+    const o = el("option", "", `${d.name} (${(d.type || "device").toLowerCase()})${d.is_active ? " · playing" : ""}`);
+    o.value = d.id;
+    select.append(o);
+  }
+  if (saved && !match) {
+    const o = el("option", "", `${saved.name} (not open right now)`);
+    o.value = saved.id;
+    select.append(o);
+  }
+  // Only one device open: no need to ask.
+  if (!saved && devices.length === 1) {
+    store.set("cl_device", { id: devices[0].id, name: devices[0].name });
+    select.value = devices[0].id;
+    return devices[0];
+  }
+  select.value = saved ? (match ? match.id : saved.id) : "";
+  return match || null;
+}
+
+function onPickDevice() {
+  const d = devices.find((x) => x.id === $("device-select").value);
+  $("device-select").blur();  // so the arrow keys swipe again
+  if (d) store.set("cl_device", { id: d.id, name: d.name });
+  else store.remove("cl_device");
+  setStatus("play-status", "");
+  if (d && autoplay()) playCurrent();
+}
+
+// Autoplay waits for you to stop on a card, so fast swiping doesn't send a pile of
+// play requests that arrive out of order.
+let playTimer = null;
+function schedulePlay() {
+  clearTimeout(playTimer);
+  playTimer = setTimeout(playCurrent, 350);
+}
+
+let playSeq = 0;
 async function playCurrent() {
+  clearTimeout(playTimer);
   const t = state.current;
   if (!t) return;
+  const seq = ++playSeq;
+  let device = savedDevice();
+  if (!device) {
+    const d = await loadDevices();
+    device = d && savedDevice();
+    if (!device) {
+      setStatus("play-status", devices.length ? "Pick where to play under Play on, then press ▶." : "Open Spotify on your phone or computer, press ↻ next to Play on, and pick it.", "err");
+      stopAutoplay();
+      return;
+    }
+  }
   const start = Math.min(30000, Math.floor((t.duration || 0) / 3));
   const fromPlaylist = { context_uri: state.playlist.uri, offset: { uri: t.uri }, position_ms: start };
   const single = { uris: [t.uri], position_ms: start };
-  setStatus("play-status", "Playing…");
   try {
     try {
-      await playOn(fromPlaylist);
+      await playOn(device, fromPlaylist);
     } catch (err) {
       if (err.status !== 400) throw err;
-      await playOn(single);
+      await playOn(device, single);
     }
+    if (seq !== playSeq) return;
     $("play-btn").classList.add("on");
     if (state.current === t) setStatus("play-status", "");
   } catch (err) {
+    if (seq !== playSeq) return;
     stopAutoplay();
     setStatus("play-status", playError(err), "err");
   }
 }
 
-// Plays on the active Spotify device, or the first one Spotify knows about.
-async function playOn(body) {
+// Plays on the chosen device. If Spotify has lost it (the app was closed and reopened,
+// so its id changed), look it up again by name once.
+async function playOn(device, body) {
+  const put = (id) => api(`/me/player/play?device_id=${encodeURIComponent(id)}`, { method: "PUT", body });
   try {
-    await api("/me/player/play", { method: "PUT", body });
+    await put(device.id);
   } catch (err) {
     if (err.status !== 404) throw err;
-    const { devices = [] } = (await api("/me/player/devices")) || {};
-    if (!devices.length) throw new ApiError(404, "no device");
-    await api(`/me/player/play?device_id=${encodeURIComponent(devices[0].id)}`, { method: "PUT", body });
+    const found = await loadDevices();
+    if (!found) throw new ApiError(404, "device gone");
+    await put(found.id);
   }
 }
 
 function playError(err) {
-  if (err.status === 404) return "Open Spotify on your phone or computer first, then press ▶ again.";
+  if (err.status === 404) return `Can't reach ${(savedDevice() || {}).name || "that device"}. Open Spotify on it, press ↻ next to Play on, then ▶.`;
   if (err.status === 403) return "Playing songs from here needs Spotify Premium. You can still swipe.";
   return `Couldn't play it: ${err.message}`;
 }
@@ -804,6 +895,8 @@ function wire() {
   $("bin-btn").addEventListener("click", () => decide("remove"));
   $("keep-btn").addEventListener("click", () => decide("keep"));
   $("play-btn").addEventListener("click", playCurrent);
+  $("device-select").addEventListener("change", onPickDevice);
+  $("device-refresh").addEventListener("click", loadDevices);
   $("undo-btn").addEventListener("click", undo);
   $("tally-bin").addEventListener("click", (e) => { e.preventDefault(); showBin(); });
   $("bin-back").addEventListener("click", (e) => { e.preventDefault(); leaveBin(); });
@@ -821,7 +914,7 @@ function wire() {
   $("backup").addEventListener("change", () => store.set("cl_backup", $("backup").checked));
 
   document.addEventListener("keydown", (e) => {
-    if ($("screen-swipe").classList.contains("hidden") || e.target.closest("input")) return;
+    if ($("screen-swipe").classList.contains("hidden") || e.target.closest("input:not([type=checkbox]), select")) return;
     if (e.key === " " && e.target.closest("button")) return;  // the button handles it
     if (e.key === "ArrowRight") decide("keep");
     else if (e.key === "ArrowLeft") decide("remove");
