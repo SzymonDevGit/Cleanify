@@ -22,7 +22,6 @@ const SCOPES = [
   "user-read-playback-state",
   "user-modify-playback-state",
   "streaming",          // the "This browser" player
-  "user-read-email",
   "user-read-private",
 ].join(" ");
 const BROWSER = "browser";      // the "Play on" value for this tab's own player
@@ -144,6 +143,14 @@ function logout() {
   store.remove("cl_me");
   store.remove("cl_playlists");
   location.reload();
+}
+
+// "Forget me": removes everything Cleanify keeps in this browser (sign-in, Client ID, progress and
+// undo history per playlist, settings). Spotify's developer rules ask for a way to disconnect and delete data.
+function forgetEverything() {
+  if (!confirm("Remove everything Cleanify keeps in this browser? You'll be signed out, and your Client ID, settings and progress through each playlist are deleted. Songs you already removed stay removed.")) return;
+  try { Object.keys(localStorage).filter((k) => k.startsWith("cl_")).forEach((k) => localStorage.removeItem(k)); } catch { /* storage blocked */ }
+  location.replace(REDIRECT_URI);
 }
 
 // Switches to another Spotify app. A sign-in belongs to one app, so it signs you out too.
@@ -1433,6 +1440,7 @@ function wire() {
   $("own-save").addEventListener("click", onOwnAppSave);
   $("own-id").addEventListener("keydown", (e) => { if (e.key === "Enter") onOwnAppSave(); });
   $("logout-link").addEventListener("click", (e) => { e.preventDefault(); logout(); });
+  $("forget-link").addEventListener("click", (e) => { e.preventDefault(); forgetEverything(); });
   // Refresh list is the "try now" button: it skips the long allowance wait (one request).
   $("refresh-btn").addEventListener("click", () => { store.remove(QUOTA_KEY); showPlaylists(true); });
   $("back-link").addEventListener("click", (e) => { e.preventDefault(); showPlaylists(); });
@@ -1485,6 +1493,7 @@ async function main() {
   if (!CLIENT_ID || !store.get("cl_token")) return showScreen("login");
   try {
     state.me = store.get("cl_me") || await api("/me");
+    delete state.me.email;  // older sign-ins included it; Cleanify never needed it
     store.set("cl_me", state.me);
     $("user-name").textContent = state.me.display_name || state.me.id;
     await showPlaylists();
