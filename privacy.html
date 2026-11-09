@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy · Cleanify</title>
+  <meta name="description" content="What Cleanify keeps in your browser, what it asks Spotify for, and who to contact.">
+  <link rel="stylesheet" href="fonts/fonts.css">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .doc { width: 100%; max-width: 720px; margin: 0 auto; padding: 24px 16px 40px; line-height: 1.6; flex: 1; }
+    .doc .logo { display: inline-block; margin-bottom: 18px; }
+    .doc h1 { font-family: "Abril Fatface", serif; font-weight: 400; font-size: 44px; margin: 8px 0 4px; }
+    .doc .rule { margin: 30px 0 10px; }
+    .doc li { margin: 6px 0; }
+    .doc .box { background: var(--card); border: 2px solid var(--ink); border-radius: 4px; padding: 4px 16px; }
+  </style>
+</head>
+<body>
+  <main class="doc">
+    <a class="logo" href="./">Cleanify</a>
+    <h1>Privacy</h1>
+    <p class="small muted">Last updated 9 November 2026</p>
+
+    <div class="box">
+      <p><strong>The short version:</strong> Cleanify runs in your browser and talks straight to Spotify. Nothing you do in it is sent to us, and there are no ads, analytics or cookies. What it remembers is kept in your own browser, and you can wipe it at any time with the button below.</p>
+    </div>
+
+    <h2 class="rule">Who runs Cleanify</h2>
+    <p>Cleanify is part of szy.monster and is run by Szymon. For anything about privacy or your data, email <a href="mailto:info@cheltenhamdata.co.uk">info@cheltenhamdata.co.uk</a>.</p>
+
+    <h2 class="rule">What Spotify shares with Cleanify</h2>
+    <p>You sign in on Spotify's own page, through a Spotify app you made in the Spotify developer dashboard. Cleanify asks Spotify for permission to:</p>
+    <ul>
+      <li>read your playlists, so you can pick one to clean;</li>
+      <li>change your playlists, to remove the songs you swipe left (and put them back if you undo), and to make the optional private backup copy;</li>
+      <li>see and control what's playing on your devices, and play music in this browser, so you can hear each song;</li>
+      <li>see your Spotify name, country and account type, to show who's signed in and which songs can play where you are.</li>
+    </ul>
+    <p>It doesn't ask for your email address. All of this goes straight between your browser and Spotify. None of it reaches szy.monster. If you pick <em>This browser</em> under Play on, Spotify's player script is loaded from Spotify. See <a href="https://www.spotify.com/uk/legal/privacy-policy/">Spotify's privacy policy</a>.</p>
+    <p>Songs you remove and the backup playlists are changes in your own Spotify account. Cleanify doesn't keep a copy anywhere else; you can delete a backup playlist in Spotify like any other.</p>
+
+    <h2 class="rule">What is kept in your browser</h2>
+    <p>Cleanify uses your browser's storage (localStorage), not cookies. It never leaves your device:</p>
+    <ul>
+      <li><strong>Your Spotify app's Client ID</strong>, so you don't paste it every time.</li>
+      <li><strong>Your Spotify sign-in</strong> (a key from Spotify that lets Cleanify act for you), plus your Spotify profile (name, country, account type) and a copy of your playlist list (refreshed after 10 minutes), so it doesn't keep asking Spotify. All removed when you sign out.</li>
+      <li><strong>Your progress through each playlist</strong>: which songs you kept or removed, and the last 100 steps so Undo and the bargain bin work.</li>
+      <li><strong>Settings</strong>: backup on or off, autoplay, which device to play on, and Spotify's "please wait" timers.</li>
+    </ul>
+    <p>Progress and settings stay until you press <strong>Forget me</strong> or clear this site's data in your browser.</p>
+
+    <h2 class="rule">Disconnect and delete</h2>
+    <div class="box">
+      <p>This removes everything Cleanify keeps in this browser, including your sign-in, Client ID and progress. Songs you already removed stay removed.</p>
+      <p><button type="button" class="btn danger" id="forget-btn">Forget me on this device</button> <span id="forget-done" class="small muted" hidden>Done. Everything is removed.</span></p>
+      <p class="small">To stop your Spotify app having access to your account too, remove it under <a href="https://www.spotify.com/account/apps/">Manage apps</a> on your Spotify account page.</p>
+    </div>
+
+    <h2 class="rule">Other companies</h2>
+    <ul>
+      <li><strong>Cloudflare</strong> hosts this site. Like any web server it sees your IP address and browser details to send you the page and protect it from attacks. See <a href="https://www.cloudflare.com/privacypolicy/">Cloudflare's privacy policy</a>.</li>
+      <li><strong>Spotify</strong>, as above.</li>
+      <li>The fonts come from this site's own server, not from Google. Links to Discord and Cheltenham Data only take you there if you click them.</li>
+    </ul>
+
+    <h2 class="rule">Your rights</h2>
+    <p>Under UK data protection law (UK GDPR) you can ask what data we hold about you, and have it corrected or deleted. We don't keep anything about you on our side, so the button above is usually all you need. If you have a question, email <a href="mailto:info@cheltenhamdata.co.uk">info@cheltenhamdata.co.uk</a>. You can also complain to the UK's data protection regulator, the <a href="https://ico.org.uk/make-a-complaint/">ICO</a>.</p>
+  </main>
+  <footer class="foot"><a href="https://szy.monster/">More from szy.monster</a></footer>
+  <script>
+    document.getElementById("forget-btn").addEventListener("click", function () {
+      if (!confirm("Remove everything Cleanify keeps in this browser?")) return;
+      try { Object.keys(localStorage).filter(function (k) { return k.indexOf("cl_") === 0; }).forEach(function (k) { localStorage.removeItem(k); }); } catch (e) { /* storage blocked */ }
+      document.getElementById("forget-done").hidden = false;
+    });
+  </script>
+</body>
+</html>
